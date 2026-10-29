@@ -38,6 +38,9 @@ FD_STATIC_ASSERT( FD_SLEEP_OUT_MAX ==FD_TOPO_MAX_TILE_OUT_LINKS, sleep_limits );
 /* Maximum number of additional destinations for leader shreds and for retransmitted shreds */
 #define FD_TOPO_ADTL_DESTS_MAX ( 32UL)
 
+/* Maximum number of Gravity relays in [tiles.gravity.relays] */
+#define FD_TOPO_GRAVITY_RELAY_MAX (4UL)
+
 #define FD_TOPO_CORE_DUMP_LEVEL_DISABLED (0)
 #define FD_TOPO_CORE_DUMP_LEVEL_MINIMAL  (1)
 #define FD_TOPO_CORE_DUMP_LEVEL_REGULAR  (2)
@@ -365,6 +368,20 @@ struct fd_topo_tile {
         char  identity_key_path[ PATH_MAX ];
         char  vote_account_path[ PATH_MAX ]; /* or pubkey is okay */
       } bundle;
+      struct {
+        int    enabled;
+        ulong  relay_cnt;
+        uint   relay_ip4 [ FD_TOPO_GRAVITY_RELAY_MAX ]; /* network byte order */
+        ushort relay_port[ FD_TOPO_GRAVITY_RELAY_MAX ];
+        char   identity_key_path[ PATH_MAX ];
+        ulong  retention_sz;
+        ulong  rx_max;
+        ulong  tx_max;
+        ulong  node_max;
+        int    filter_ofac;
+        ushort jito_tip_weight_bps;
+        char   bundle_uri[ 65 ]; /* block engine url of forwarded Jito bundles, "" if none */
+      } gravity;
       ulong acct_blocklist_cnt;
       fd_pubkey_t acct_blocklist[ FD_PACK_ACCT_BLOCKLIST_MAX ];
     } pack;

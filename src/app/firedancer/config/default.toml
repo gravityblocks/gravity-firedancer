@@ -1668,6 +1668,62 @@ telemetry = true
         # this option to 'false'.
         tls_cert_verify = true
 
+    # The pack tile can take its block contents from a Gravity block
+    # building relay instead of its own scheduler.  When enabled, pack
+    # keeps a TCP session to the relay, reports slot progress, forwards
+    # the transactions it receives, and during its leader windows
+    # executes the mini-block graphs the relay sends.
+    #
+    # A leader window is relay built if the session is up at its first
+    # leader slot, and packed natively otherwise.  A relay built window
+    # stays relay built to its end, even if slots stay empty because
+    # nothing from the relay could be scheduled, unless the session
+    # drops (the rest of the window is then packed natively).  As with
+    # gravity-connector, a relay built window that ends with a slot in
+    # which transactions were forwarded but nothing from the relay was
+    # scheduled trips a failsafe: later windows are packed natively and
+    # pack stops reporting progress to the relay, until the relay sends
+    # DeleteFailsafe (relay admin endpoint) or Firedancer restarts.
+    #
+    # With [tiles.bundle] enabled, pack cranks the Jito tip accounts
+    # before the relay's mini-blocks run in a slot, and Jito bundles are
+    # forwarded to the relay (in relay built windows they only execute
+    # as part of the relay's mini-blocks).  Without it, tips in relay
+    # built blocks go to whatever tip receiver is configured on chain.
+    # [tiles.pack] use_consumed_cus must be enabled with [tiles.bundle].
+    [tiles.gravity]
+        # True if pack should connect to a Gravity relay.
+        enabled = false
+
+        # Relay addresses as "ip:port" strings (IPv4 literals, no DNS).
+        # At most 4.  Pack is connected to one relay at a time and
+        # rotates to the next after repeated failures.
+        relays = []
+
+        # Pack retains a copy of every transaction it forwards to the
+        # relay, because the relay refers to forwarded transactions by
+        # signature only.  This is the size of that retention buffer,
+        # at most 65536.
+        retention_buffer_mib = 256
+
+        # Session buffer sizes, at most 64 each.  The receive buffer
+        # bounds the largest mini-block graph that can be received.
+        receive_buffer_mib = 32
+        send_buffer_mib = 8
+
+        # Maximum number of relay graph nodes pack tracks at once, at
+        # most 1048576.
+        max_lane_nodes = 16384
+
+        # Passed to the relay in the handshake.  filter_ofac asks the
+        # relay to exclude transactions touching OFAC sanctioned
+        # addresses.  jito_tip_weight_bps is the fraction of Jito tip
+        # value the relay counts when valuing blocks, in basis points in
+        # [0,10000].  The accounts in [tiles.pack.account_blocklist]
+        # are also passed, so builders avoid them.
+        filter_ofac = false
+        jito_tip_weight_bps = 10000
+
     # The pack tile takes incoming transactions that have been verified
     # by the verify tile and then deduplicated, and attempts to order
     # them in an optimal way to generate the most fees per compute

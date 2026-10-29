@@ -757,6 +757,11 @@ ulong fd_pack_expire_before( fd_pack_t * pack, ulong expire_before );
    might be >1 if a bundle was caused to be deleted. */
 ulong fd_pack_delete_transaction( fd_pack_t * pack, fd_ed25519_sig_t const * sig0 );
 
+/* fd_pack_delete_bundles removes every pending bundle except initializer
+   bundles from the pool of available transactions.  Returns the number
+   of transactions deleted. */
+ulong fd_pack_delete_bundles( fd_pack_t * pack );
+
 /* fd_pack_end_block resets some state to prepare for the next block.
    Specifically, the per-block limits are cleared and transactions in
    the microblocks scheduled after the call to this function are allowed

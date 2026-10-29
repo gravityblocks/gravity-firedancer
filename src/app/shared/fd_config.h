@@ -403,6 +403,18 @@ struct fd_config {
     } bundle;
 
     struct {
+      int   enabled;
+      ulong relays_cnt;
+      char  relays[ FD_TOPO_GRAVITY_RELAY_MAX ][ FD_HOSTPORT_BUF_MAX ];
+      uint  retention_buffer_mib;
+      uint  receive_buffer_mib;
+      uint  send_buffer_mib;
+      uint  max_lane_nodes;
+      int   filter_ofac;
+      uint  jito_tip_weight_bps;
+    } gravity;
+
+    struct {
       uint  max_pending_transactions;
       int   use_consumed_cus;
       char  schedule_strategy[ 16 ];

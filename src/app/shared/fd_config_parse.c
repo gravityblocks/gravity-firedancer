@@ -193,6 +193,15 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( ulong,  tiles.bundle.keepalive_interval_millis           );
   CFG_POP      ( bool,   tiles.bundle.tls_cert_verify                     );
 
+  CFG_POP      ( bool,   tiles.gravity.enabled                            );
+  CFG_POP_ARRAY( cstr,   tiles.gravity.relays                             );
+  CFG_POP      ( uint,   tiles.gravity.retention_buffer_mib               );
+  CFG_POP      ( uint,   tiles.gravity.receive_buffer_mib                 );
+  CFG_POP      ( uint,   tiles.gravity.send_buffer_mib                    );
+  CFG_POP      ( uint,   tiles.gravity.max_lane_nodes                     );
+  CFG_POP      ( bool,   tiles.gravity.filter_ofac                        );
+  CFG_POP      ( uint,   tiles.gravity.jito_tip_weight_bps                );
+
   CFG_POP      ( uint,   tiles.pack.max_pending_transactions              );
   CFG_POP      ( bool,   tiles.pack.use_consumed_cus                      );
   CFG_POP      ( cstr,   tiles.pack.schedule_strategy                     );

@@ -1,6 +1,9 @@
 #include "../tiles.h"
 
 #include <linux/futex.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "generated/fd_pack_tile_seccomp.h"
 
 #include "../../util/pod/fd_pod_format.h"
@@ -15,6 +18,7 @@
 #include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
 #include "../fd_clock_tile.h"
+#include "gravity/fd_gravity.h"
 
 #include <string.h>
 
@@ -28,6 +32,7 @@
 #define IN_KIND_EXECLE       (2UL)
 #define IN_KIND_SIGN         (3UL)
 #define IN_KIND_REPLAY       (4UL)
+#define IN_KIND_EXECLE_POH   (5UL) /* gravity: execution results */
 
 /* Pace microblocks, but only slightly.  This helps keep performance
    more stable.  This limit is 2,000 microblocks/second/execle.  At
@@ -271,6 +276,32 @@ typedef struct {
   } crank[1];
 
 
+  /* Gravity relay client (see gravity/fd_gravity.h), NULL if disabled */
+  struct {
+    fd_gravity_t *         g;
+    fd_keyguard_client_t * keyguard;   /* crank->keyguard_client if the bundle tile is enabled, else keyguard_ */
+    fd_keyguard_client_t   keyguard_[1];
+    fd_keyswitch_t *       keyswitch;  /* NULL if the crank handles the keyswitch */
+    uchar                  identity[ 32 ];
+    long                   next_log_ns;
+
+    /* Tip crank in GRAVITY slots (bundle tile enabled), see
+       gravity_became_leader */
+    int                    ib_forced;        /* initializer bundles were made ready without a crank this slot */
+    ulong                  crank_off_window; /* slot/4 of a window the crank gave up in */
+    fd_bundle_crank_tip_payment_config_t crank_config[1]; /* as of became_leader */
+    fd_acct_addr_t         crank_owner[1];
+    uchar                  in_worker[ FD_TOPO_MAX_TILE_IN_LINKS ];
+
+    /* Used between during_frag and after_frag */
+    ulong                  replay_slot;
+    uchar                  replay_hash[ 32 ];
+    ulong                  replay_next_leader;
+    ulong                  exec_cnt;
+    uint                   exec_flags[ FD_PACK_MAX_TXN_PER_BUNDLE ];
+    uint                   exec_cus  [ FD_PACK_MAX_TXN_PER_BUNDLE ];
+  } gravity;
+
   /* Used between during_frag and after_frag */
   ulong pending_rebate_sz;
   union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } rebate[1];
@@ -301,7 +332,13 @@ update_metric_state( fd_pack_ctx_t * ctx,
 }
 
 static inline void
-remove_ib( fd_pack_ctx_t * ctx ) {
+remove_ib( fd_pack_ctx_t * ctx,
+           int             end_reason ) {
+  /* remove_ib is called on every path that ends a leader slot */
+  if( FD_UNLIKELY( ctx->gravity.g ) ) {
+    fd_gravity_slot_end( ctx->gravity.g, ctx->pack, end_reason==FD_PACK_END_SLOT_REASON_ABANDONED, fd_clock_tile_now( ctx->clock ) );
+  }
+
   /* It's likely the initializer bundle is long scheduled, but we want to
      try deleting it just in case. */
   if( FD_UNLIKELY( ctx->crank->enabled & ctx->crank->ib_inserted ) ) {
@@ -316,6 +353,43 @@ FD_FN_CONST static inline ulong
 scratch_align( void ) {
   return 4096UL;
 }
+
+/* A session must have been sending Progress this long before a window
+   is relay built: the relay announces connectors to builders every
+   10 s, and builders drop orders of connectors they don't know yet, so
+   the first window would likely stay empty and trip the failsafe. */
+#define GRAVITY_WARMUP_NS (12000000000L)
+
+static void
+gravity_cfg( fd_topo_tile_t const * tile,
+             uchar const *          identity,
+             fd_gravity_cfg_t *     cfg ) {
+  memset( cfg, 0, sizeof(fd_gravity_cfg_t) );
+  if( identity ) fd_memcpy( cfg->identity, identity, 32UL );
+  cfg->relay_cnt = tile->pack.gravity.relay_cnt;
+  for( ulong i=0UL; i<cfg->relay_cnt; i++ ) {
+    cfg->relay_ip4 [ i ] = tile->pack.gravity.relay_ip4 [ i ];
+    cfg->relay_port[ i ] = tile->pack.gravity.relay_port[ i ];
+  }
+  cfg->rx_max              = tile->pack.gravity.rx_max;
+  cfg->tx_max              = tile->pack.gravity.tx_max;
+  cfg->retention_sz        = tile->pack.gravity.retention_sz;
+  cfg->node_max            = tile->pack.gravity.node_max;
+  cfg->order_max           = tile->pack.gravity.node_max;
+  cfg->num_threads         = (uchar)fd_ulong_min( tile->pack.execle_tile_count, 255UL );
+  cfg->jito_tip_weight_bps = tile->pack.gravity.jito_tip_weight_bps;
+  cfg->filter_ofac         = tile->pack.gravity.filter_ofac;
+  cfg->warmup_ns           = GRAVITY_WARMUP_NS;
+  cfg->bundle_meta_sz      = BUNDLE_META_SZ;
+  fd_cstr_ncpy( cfg->version,    "firedancer-gravity",             sizeof(cfg->version)    );
+  fd_cstr_ncpy( cfg->bundle_uri, tile->pack.gravity.bundle_uri,    sizeof(cfg->bundle_uri) );
+  /* Builders avoid the accounts pack would reject */
+  cfg->blacklist_cnt = tile->pack.acct_blocklist_cnt;
+  for( ulong i=0UL; i<cfg->blacklist_cnt; i++ ) fd_memcpy( cfg->blacklist[ i ], tile->pack.acct_blocklist[ i ].uc, 32UL );
+}
+
+FD_STATIC_ASSERT( FD_TOPO_GRAVITY_RELAY_MAX==FD_GRAVITY_SESS_RELAY_MAX,  gravity_relay_max );
+FD_STATIC_ASSERT( FD_PACK_ACCT_BLOCKLIST_MAX<=FD_GRAVITY_BLACKLIST_MAX, gravity_blacklist_max );
 
 FD_FN_PURE static inline ulong
 scratch_footprint( fd_topo_tile_t const * tile ) {
@@ -335,7 +409,305 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
                                                                         BUNDLE_META_SZ,
                                                                         tile->pack.execle_tile_count,
                                                                         limits                               ) );
+  if( FD_UNLIKELY( tile->pack.gravity.enabled ) ) {
+    fd_gravity_cfg_t cfg[1];
+    gravity_cfg( tile, NULL, cfg );
+    l = FD_LAYOUT_APPEND( l, fd_gravity_align(),     fd_gravity_footprint( cfg ) );
+  }
   return FD_LAYOUT_FINI( l, scratch_align() );
+}
+
+/* crank_try generates the tip crank for the block builder in top_meta,
+   and inserts it as an initializer bundle unless the on-chain tip
+   payment config is already up to date.  Returns one of CRANK_*.
+   top_meta is copied first: a pointer from fd_pack_peek_bundle_meta is
+   only valid until the next insert. */
+
+#define CRANK_UP_TO_DATE ( 0)
+#define CRANK_INSERTED   ( 1)
+#define CRANK_FAILED     (-1)
+
+static int
+crank_try( fd_pack_ctx_t *              ctx,
+           block_builder_info_t const * meta ) {
+  block_builder_info_t top_meta[1] = { *meta };
+
+  fd_txn_e_t * _bundle[ 1UL ];
+  fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( ctx->pack, _bundle, 1UL );
+
+  ulong txn_sz = fd_bundle_crank_generate( ctx->crank->gen, ctx->crank->prev_config, top_meta->commission_pubkey,
+      ctx->crank->identity_pubkey, ctx->crank->tip_receiver_owner, ctx->crank->epoch, top_meta->commission,
+      bundle[0]->txnp->payload, TXN( bundle[0]->txnp ) );
+
+  if( FD_LIKELY( txn_sz==0UL ) ) { /* Everything in good shape! */
+    fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
+    fd_pack_set_initializer_bundles_ready( ctx->pack );
+    ctx->crank->metrics[ 0 ]++; /* BUNDLE_CRANK_ATTEMPTED_UP_TO_DATE */
+    return CRANK_UP_TO_DATE;
+  }
+  else if( FD_LIKELY( txn_sz<ULONG_MAX ) ) {
+    bundle[0]->txnp->payload_sz  = (ushort)txn_sz;
+    bundle[0]->txnp->source_tpu  = FD_TXN_M_TPU_SOURCE_BUNDLE;
+    bundle[0]->txnp->source_ipv4 = 0; /* not applicable */
+    bundle[0]->txnp->scheduler_arrival_time_nanos = fd_clock_tile_now( ctx->clock );
+    bundle[0]->txnp->first_seen_nanos = bundle[0]->txnp->scheduler_arrival_time_nanos;
+    memcpy( bundle[0]->txnp->payload+TXN(bundle[0]->txnp)->recent_blockhash_off, ctx->crank->recent_blockhash, 32UL );
+
+    fd_keyguard_client_sign( ctx->crank->keyguard_client, bundle[0]->txnp->payload+1UL,
+        bundle[0]->txnp->payload+65UL, txn_sz-65UL, FD_KEYGUARD_SIGN_TYPE_ED25519 );
+
+    memcpy( ctx->crank->last_sig, bundle[0]->txnp->payload+1UL, 64UL );
+
+    ctx->crank->ib_inserted = 1;
+    ulong deleted;
+    int retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->block_height-1UL, 1, NULL, &deleted );
+    FD_MCNT_INC( PACK, TXN_EVICTED, deleted );
+    ctx->insert_result[ retval + FD_PACK_INSERT_RETVAL_OFF ]++;
+    if( FD_UNLIKELY( retval<0 ) ) {
+      ctx->crank->metrics[ 3 ]++; /* BUNDLE_CRANK_ATTEMPTED_INSERTION_FAILED */
+      FD_LOG_WARNING(( "inserting initializer bundle returned %i", retval ));
+      return CRANK_FAILED;
+    } else {
+      /* Update the cached copy of the on-chain state.  This seems a
+         little dangerous, since we're updating it as if the bundle
+         succeeded without knowing if that's true, but here's why
+         it's safe:
+
+         From now until we get the rebate call for this initializer
+         bundle (which lets us know if it succeeded or failed), pack
+         will be in [Pending] state, which means peek_bundle_meta
+         will return NULL, so we won't read this state.
+
+         Then, if the initializer bundle failed, we'll go into
+         [Failed] IB state until the end of the block, which will
+         cause top_meta to remain NULL so we don't read these values
+         again.
+
+         Otherwise, the initializer bundle succeeded, which means
+         that these are the right values to use. */
+      fd_bundle_crank_apply( ctx->crank->gen, ctx->crank->prev_config, top_meta->commission_pubkey,
+                             ctx->crank->tip_receiver_owner, ctx->crank->epoch, top_meta->commission );
+      ctx->crank->metrics[ 1 ]++; /* BUNDLE_CRANK_ATTEMPTED_INSERTED */
+      return CRANK_INSERTED;
+    }
+  } else {
+    /* Already logged a warning in this case */
+    fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
+    ctx->crank->metrics[ 2 ]++; /* BUNDLE_CRANK_ATTEMPTED_CREATION_FAILED */
+    return CRANK_FAILED;
+  }
+}
+
+/* Gravity relay client hooks (see gravity/fd_gravity.h) **************/
+
+static void
+gravity_housekeeping( fd_pack_ctx_t * ctx ) {
+  long now = fd_clock_tile_now( ctx->clock );
+  if( FD_UNLIKELY( ctx->gravity.keyswitch && fd_keyswitch_state_query( ctx->gravity.keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
+    fd_gravity_set_identity( ctx->gravity.g, ctx->gravity.keyswitch->bytes, now );
+    fd_keyswitch_state( ctx->gravity.keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
+  }
+
+  if( FD_UNLIKELY( now>=ctx->gravity.next_log_ns ) ) {
+    ctx->gravity.next_log_ns = now + 10000000000L;
+    fd_gravity_metrics_t const * m = fd_gravity_metrics( ctx->gravity.g );
+    fd_gravity_sess_t const *    s = fd_gravity_sess( ctx->gravity.g );
+    FD_LOG_NOTICE(( "gravity: state=%i sessions=%lu progress=%lu fwd=%lu fwd_drop=%lu graphs=%lu graphs_rej=%lu "
+                    "nodes_ins=%lu nodes_rej=%lu unknown=%lu alt=%lu incl=%lu not_incl=%lu synth=%lu "
+                    "ret_hit=%lu ret_miss=%lu win_gravity=%lu win_native=%lu fb_session=%lu missed=%lu failsafe=%i trips=%lu "
+                    "jito_rx=%lu jito_dup=%lu jito_native=%lu jito_fwd=%lu jito_fwd_drop=%lu jito_pulled=%lu jito_reins=%lu jito_hit=%lu",
+                    s->state, s->session_cnt, m->progress_sent, m->txn_forwarded, m->txn_fwd_dropped, m->graphs, m->graphs_rejected,
+                    m->nodes_inserted, m->nodes_rejected, m->nodes_unknown, m->nodes_alt, m->results_included, m->results_not_included,
+                    m->results_synthetic, m->retention_hit, m->retention_miss, m->windows_gravity, m->windows_native,
+                    m->fallback_session, m->slots_missed, fd_gravity_failsafe( ctx->gravity.g ), m->failsafe_trips,
+                    m->jito_rx, m->jito_dup, m->jito_native, m->jito_fwd, m->jito_fwd_dropped, m->jito_pulled, m->jito_reinserted, m->jito_hit ));
+    if( FD_UNLIKELY( fd_gravity_failsafe( ctx->gravity.g ) ) ) {
+      FD_LOG_WARNING(( "gravity: failsafe tripped, leader windows are packed natively until the relay sends DeleteFailsafe "
+                       "(relay admin delete-failsafe for this identity) or a restart" ));
+    }
+  }
+}
+
+static void
+gravity_before_credit( fd_pack_ctx_t * ctx,
+                       int *           charge_busy ) {
+  if( fd_gravity_poll( ctx->gravity.g, ctx->pack, NULL, fd_clock_tile_now( ctx->clock ) ) ) *charge_busy = 1;
+
+  fd_gravity_sess_t * sess = fd_gravity_sess( ctx->gravity.g );
+  if( FD_UNLIKELY( fd_gravity_sess_need_sign( sess ) ) ) {
+    uchar sig[ 64 ];
+    fd_keyguard_client_sign( ctx->gravity.keyguard, sig, fd_gravity_sess_auth_msg( sess ), FD_GRAVITY_AUTH_MSG_SZ, FD_KEYGUARD_SIGN_TYPE_ED25519 );
+    fd_gravity_sess_signed( sess, sig, fd_clock_tile_now( ctx->clock ) );
+    *charge_busy = 1;
+  }
+}
+
+/* gravity_crank_off gives up the tip crank for the rest of the window
+   and lets the lane run without it (gravity-connector likewise treats a
+   failed crank as done and never holds graphs for it).  Tips then go
+   to the tip receiver configured on chain. */
+
+static void
+gravity_crank_off( fd_pack_ctx_t * ctx,
+                   char const *    why ) {
+  FD_LOG_WARNING(( "gravity: tip crank %s in slot %lu, relay mini-blocks of this window run without it", why, ctx->leader_slot ));
+  ctx->gravity.crank_off_window = ctx->leader_slot/4UL;
+  ctx->gravity.ib_forced        = 1;
+  fd_pack_set_initializer_bundles_ready( ctx->pack );
+}
+
+/* gravity_became_leader starts a leader slot for gravity.  In a GRAVITY
+   slot the tip crank (bundle tile enabled) runs right away, so its
+   initializer bundle executes before the first mini-block arrives: lane
+   nodes are bundles, held until it did.  It is skipped if the block
+   builder is not known yet (no Jito bundle since boot), the tip payment
+   config could not be read (zeros from replay), or it failed earlier in
+   the window. */
+
+static void
+gravity_became_leader( fd_pack_ctx_t * ctx,
+                       long            now ) {
+  static uchar const zero[ 32 ];
+  int crank = ctx->crank->enabled &&
+              ctx->crank->prev_config->discriminator==0x82ccfa1ee0aa0c9bUL &&
+              memcmp( ctx->blk_engine_cfg->commission_pubkey->b, zero, 32UL ) &&
+              ctx->gravity.crank_off_window!=ctx->leader_slot/4UL;
+  ctx->gravity.ib_forced = 0;
+  *ctx->gravity.crank_config = *ctx->crank->prev_config;
+  *ctx->gravity.crank_owner  = *ctx->crank->tip_receiver_owner;
+
+  int mode = fd_gravity_became_leader( ctx->gravity.g, ctx->pack, ctx->leader_slot, ctx->_became_leader->slot_start_ns,
+                                       ctx->slot_end_ns, ctx->block_height, crank, now );
+  if( mode!=FD_GRAVITY_MODE_GRAVITY ) return;
+  if( !crank ) {
+    ctx->gravity.ib_forced = ctx->crank->enabled; /* fd_gravity_became_leader made them ready */
+    return;
+  }
+  if( FD_UNLIKELY( crank_try( ctx, ctx->blk_engine_cfg )==CRANK_FAILED ) ) gravity_crank_off( ctx, "could not be inserted" );
+}
+
+/* gravity_ib_failed handles a failed initializer bundle (the tip crank)
+   in a GRAVITY slot.  Pack would hold all bundles for the rest of the
+   block.  The cached tip payment config (applied when the crank was
+   inserted) is restored, so a NATIVE fallback cranks from the real one. */
+
+static void
+gravity_ib_failed( fd_pack_ctx_t * ctx ) {
+  if( fd_gravity_mode( ctx->gravity.g )!=FD_GRAVITY_MODE_GRAVITY ) return;
+  *ctx->crank->prev_config        = *ctx->gravity.crank_config;
+  *ctx->crank->tip_receiver_owner = *ctx->gravity.crank_owner;
+  gravity_crank_off( ctx, "failed" );
+}
+
+/* gravity_schedule_flags restricts what pack schedules: only the lane
+   (and the crank) in GRAVITY slots, and no bundles after a fallback to
+   NATIVE in a slot whose initializer bundles were made ready without a
+   crank (Jito bundles must not run uncranked). */
+
+static inline int
+gravity_schedule_flags( fd_pack_ctx_t * ctx,
+                        int             flags ) {
+  if( fd_gravity_mode( ctx->gravity.g )==FD_GRAVITY_MODE_GRAVITY ) return FD_PACK_SCHEDULE_BUNDLE;
+  if( FD_UNLIKELY( ctx->gravity.ib_forced ) ) return flags & ~FD_PACK_SCHEDULE_BUNDLE;
+  return flags;
+}
+
+/* gravity_during_replay stashes the replay messages that drive
+   Progress.  Returns 1 if sig is one of them. */
+
+static int
+gravity_during_replay( fd_pack_ctx_t * ctx,
+                       ulong           sig,
+                       void const *    dcache_entry ) {
+  switch( sig ) {
+  case REPLAY_SIG_SLOT_COMPLETED: {
+    fd_replay_slot_completed_t const * msg = fd_type_pun_const( dcache_entry );
+    ctx->gravity.replay_slot = msg->slot;
+    memcpy( ctx->gravity.replay_hash, msg->block_hash.uc, 32UL );
+    return 1;
+  }
+  case REPLAY_SIG_NEXT_LEADER: {
+    fd_replay_next_leader_t const * msg = fd_type_pun_const( dcache_entry );
+    ctx->gravity.replay_next_leader = msg->next_leader_slot;
+    return 1;
+  }
+  case REPLAY_SIG_RESET: {
+    fd_poh_reset_t const * msg = fd_type_pun_const( dcache_entry );
+    ctx->gravity.replay_slot        = msg->completed_slot;
+    ctx->gravity.replay_next_leader = msg->next_leader_slot;
+    memcpy( ctx->gravity.replay_hash, msg->completed_blockhash, 32UL );
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
+static void
+gravity_after_replay( fd_pack_ctx_t * ctx,
+                      ulong           sig ) {
+  long now = fd_clock_tile_now( ctx->clock );
+  switch( sig ) {
+  case REPLAY_SIG_SLOT_COMPLETED:
+    fd_gravity_slot_completed( ctx->gravity.g, ctx->gravity.replay_slot, ctx->gravity.replay_hash, now );
+    break;
+  case REPLAY_SIG_NEXT_LEADER:
+    fd_gravity_next_leader( ctx->gravity.g, ctx->gravity.replay_next_leader, now );
+    break;
+  case REPLAY_SIG_RESET:
+    fd_gravity_reset( ctx->gravity.g, ctx->gravity.replay_slot, ctx->gravity.replay_hash, ctx->gravity.replay_next_leader, now );
+    break;
+  default:
+    break;
+  }
+}
+
+static void
+gravity_init( fd_pack_ctx_t *          ctx,
+              fd_topo_t const *        topo,
+              fd_topo_tile_t const *   tile,
+              void *                   mem,
+              fd_gravity_cfg_t const * cfg ) {
+  ctx->gravity.g = fd_gravity_new( mem, cfg );
+  if( FD_UNLIKELY( !ctx->gravity.g ) ) FD_LOG_ERR(( "fd_gravity_new failed" ));
+  ctx->gravity.next_log_ns      = 0L;
+  ctx->gravity.exec_cnt         = 0UL;
+  ctx->gravity.ib_forced        = 0;
+  ctx->gravity.crank_off_window = ULONG_MAX;
+
+  /* The relay authenticates the identity key.  With the bundle tile, the
+     crank's keyguard client and keyswitch are shared: a second client on
+     the same links would mix up request sequence numbers, and the
+     keyswitch has one consumer. */
+  if( FD_UNLIKELY( ctx->crank->enabled ) ) {
+    ctx->gravity.keyguard  = ctx->crank->keyguard_client;
+    ctx->gravity.keyswitch = NULL;
+    FD_LOG_NOTICE(( "gravity: enabled with the bundle tile, %lu relay(s), first " FD_IP4_ADDR_FMT ":%hu",
+                    tile->pack.gravity.relay_cnt, FD_IP4_ADDR_FMT_ARGS( tile->pack.gravity.relay_ip4[ 0 ] ), tile->pack.gravity.relay_port[ 0 ] ));
+    return;
+  }
+  ulong sign_in_idx  = fd_topo_find_tile_in_link ( topo, tile, "sign_pack", tile->kind_id );
+  ulong sign_out_idx = fd_topo_find_tile_out_link( topo, tile, "pack_sign", tile->kind_id );
+  FD_TEST( sign_in_idx!=ULONG_MAX && sign_out_idx!=ULONG_MAX );
+  fd_topo_link_t const * sign_in  = &topo->links[ tile->in_link_id [ sign_in_idx  ] ];
+  fd_topo_link_t const * sign_out = &topo->links[ tile->out_link_id[ sign_out_idx ] ];
+
+  fd_sleep_t * sleep = NULL;
+  if( FD_UNLIKELY( topo->sleep_obj_id!=ULONG_MAX ) ) {
+    sleep = fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) );
+    FD_TEST( sleep );
+  }
+  ctx->gravity.keyguard = ctx->gravity.keyguard_;
+  if( FD_UNLIKELY( !fd_keyguard_client_join( fd_keyguard_client_new( ctx->gravity.keyguard,
+          sign_out->mcache, sign_out->dcache, sign_in->mcache, sign_in->dcache,
+          sign_out->mtu, sign_in->mtu, sleep, sign_out->id, fd_topo_find_link_consumer( topo, sign_out ) ) ) ) ) {
+    FD_LOG_ERR(( "failed to construct keyguard" ));
+  }
+
+  ctx->gravity.keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
+  FD_TEST( ctx->gravity.keyswitch );
+  FD_LOG_NOTICE(( "gravity: enabled, %lu relay(s), first " FD_IP4_ADDR_FMT ":%hu",
+                  tile->pack.gravity.relay_cnt, FD_IP4_ADDR_FMT_ARGS( tile->pack.gravity.relay_ip4[ 0 ] ), tile->pack.gravity.relay_port[ 0 ] ));
 }
 
 static inline void
@@ -460,8 +832,11 @@ during_housekeeping( fd_pack_ctx_t * ctx ) {
 
   if( FD_UNLIKELY( ctx->crank->enabled && fd_keyswitch_state_query( ctx->crank->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
     fd_memcpy( ctx->crank->identity_pubkey, ctx->crank->keyswitch->bytes, 32UL );
+    if( FD_UNLIKELY( ctx->gravity.g ) ) fd_gravity_set_identity( ctx->gravity.g, ctx->crank->keyswitch->bytes, fd_clock_tile_now( ctx->clock ) );
     fd_keyswitch_state( ctx->crank->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
   }
+
+  if( FD_UNLIKELY( ctx->gravity.g ) ) gravity_housekeeping( ctx );
 
   if( FD_LIKELY( ctx->leader_slot!=ULONG_MAX && ctx->slot_mixin_per_tick ) ) {
     ulong raw = compute_dynamic_max_microblocks( ctx );
@@ -510,12 +885,15 @@ before_credit( fd_pack_ctx_t *     ctx,
     fd_pack_insert_txn_cancel( ctx->pack, ctx->cur_spot );
     ctx->cur_spot = NULL;
   }
+
+  if( FD_UNLIKELY( ctx->gravity.g ) ) gravity_before_credit( ctx, charge_busy );
 }
 
 static inline int
 prevent_park( fd_pack_ctx_t * ctx ) {
-  /* skip_cnt counts loop iterations, not time, never park through it */
-  return ctx->skip_cnt>0L;
+  /* skip_cnt counts loop iterations, not time, never park through it.
+     The gravity socket is polled from the run loop, so never park. */
+  return ctx->skip_cnt>0L || !!ctx->gravity.g;
 }
 
 static inline long
@@ -607,7 +985,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
-    remove_ib( ctx );
+    remove_ib( ctx, FD_PACK_END_SLOT_REASON_TIME );
 
     update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
     update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
@@ -635,6 +1013,8 @@ after_credit( fd_pack_ctx_t *     ctx,
     return;
   }
 
+  if( FD_UNLIKELY( ctx->gravity.g ) ) fd_gravity_check_fallback( ctx->gravity.g, ctx->pack, fd_clock_tile_now( ctx->clock ) );
+
   if( FD_UNLIKELY( ctx->pending_reduce_mb_bound ) ) {
     ctx->pending_reduce_mb_bound = 0;
     ulong * dst = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
@@ -654,70 +1034,16 @@ after_credit( fd_pack_ctx_t *     ctx,
   *charge_busy = 1;
 
   if( FD_LIKELY( ctx->crank->enabled ) ) {
-    block_builder_info_t const * top_meta = fd_pack_peek_bundle_meta( ctx->pack );
-    if( FD_UNLIKELY( top_meta ) ) {
+    if( FD_UNLIKELY( ctx->gravity.g && fd_gravity_mode( ctx->gravity.g )==FD_GRAVITY_MODE_GRAVITY ) ) {
+      /* Cranked (or given up) at became_leader, see
+         gravity_became_leader.  A lane node at the head with no
+         initializer bundle ahead means it is gone (evicted): don't hold
+         the lane. */
+      if( FD_UNLIKELY( fd_pack_peek_bundle_meta( ctx->pack ) ) ) fd_pack_set_initializer_bundles_ready( ctx->pack );
+    } else {
+      block_builder_info_t const * top_meta = fd_pack_peek_bundle_meta( ctx->pack );
       /* Have bundles, in a reasonable state to crank. */
-
-      fd_txn_e_t * _bundle[ 1UL ];
-      fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( ctx->pack, _bundle, 1UL );
-
-      ulong txn_sz = fd_bundle_crank_generate( ctx->crank->gen, ctx->crank->prev_config, top_meta->commission_pubkey,
-          ctx->crank->identity_pubkey, ctx->crank->tip_receiver_owner, ctx->crank->epoch, top_meta->commission,
-          bundle[0]->txnp->payload, TXN( bundle[0]->txnp ) );
-
-      if( FD_LIKELY( txn_sz==0UL ) ) { /* Everything in good shape! */
-        fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
-        fd_pack_set_initializer_bundles_ready( ctx->pack );
-        ctx->crank->metrics[ 0 ]++; /* BUNDLE_CRANK_ATTEMPTED_UP_TO_DATE */
-      }
-      else if( FD_LIKELY( txn_sz<ULONG_MAX ) ) {
-        bundle[0]->txnp->payload_sz  = (ushort)txn_sz;
-        bundle[0]->txnp->source_tpu  = FD_TXN_M_TPU_SOURCE_BUNDLE;
-        bundle[0]->txnp->source_ipv4 = 0; /* not applicable */
-        bundle[0]->txnp->scheduler_arrival_time_nanos = fd_clock_tile_now( ctx->clock );
-        bundle[0]->txnp->first_seen_nanos = bundle[0]->txnp->scheduler_arrival_time_nanos;
-        memcpy( bundle[0]->txnp->payload+TXN(bundle[0]->txnp)->recent_blockhash_off, ctx->crank->recent_blockhash, 32UL );
-
-        fd_keyguard_client_sign( ctx->crank->keyguard_client, bundle[0]->txnp->payload+1UL,
-            bundle[0]->txnp->payload+65UL, txn_sz-65UL, FD_KEYGUARD_SIGN_TYPE_ED25519 );
-
-        memcpy( ctx->crank->last_sig, bundle[0]->txnp->payload+1UL, 64UL );
-
-        ctx->crank->ib_inserted = 1;
-        ulong deleted;
-        int retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->block_height-1UL, 1, NULL, &deleted );
-        FD_MCNT_INC( PACK, TXN_EVICTED, deleted );
-        ctx->insert_result[ retval + FD_PACK_INSERT_RETVAL_OFF ]++;
-        if( FD_UNLIKELY( retval<0 ) ) {
-          ctx->crank->metrics[ 3 ]++; /* BUNDLE_CRANK_ATTEMPTED_INSERTION_FAILED */
-          FD_LOG_WARNING(( "inserting initializer bundle returned %i", retval ));
-        } else {
-          /* Update the cached copy of the on-chain state.  This seems a
-             little dangerous, since we're updating it as if the bundle
-             succeeded without knowing if that's true, but here's why
-             it's safe:
-
-             From now until we get the rebate call for this initializer
-             bundle (which lets us know if it succeeded or failed), pack
-             will be in [Pending] state, which means peek_bundle_meta
-             will return NULL, so we won't read this state.
-
-             Then, if the initializer bundle failed, we'll go into
-             [Failed] IB state until the end of the block, which will
-             cause top_meta to remain NULL so we don't read these values
-             again.
-
-             Otherwise, the initializer bundle succeeded, which means
-             that these are the right values to use. */
-          fd_bundle_crank_apply( ctx->crank->gen, ctx->crank->prev_config, top_meta->commission_pubkey,
-                                 ctx->crank->tip_receiver_owner, ctx->crank->epoch, top_meta->commission );
-          ctx->crank->metrics[ 1 ]++; /* BUNDLE_CRANK_ATTEMPTED_INSERTED */
-        }
-      } else {
-        /* Already logged a warning in this case */
-        fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
-        ctx->crank->metrics[ 2 ]++; /* BUNDLE_CRANK_ATTEMPTED_CREATION_FAILED */
-      }
+      if( FD_UNLIKELY( top_meta ) ) crank_try( ctx, top_meta );
     }
   }
 
@@ -745,6 +1071,8 @@ after_credit( fd_pack_ctx_t *     ctx,
         break;
     }
 
+    if( FD_UNLIKELY( ctx->gravity.g ) ) flags = gravity_schedule_flags( ctx, flags );
+
     fd_pack_out_ctx_t * execle_out = &ctx->execle_out[ i ];
     fd_txn_e_t * microblock_dst = fd_chunk_to_laddr( execle_out->mem, execle_out->chunk );
     long schedule_duration = -fd_tickcount();
@@ -754,6 +1082,9 @@ after_credit( fd_pack_ctx_t *     ctx,
 
     if( FD_LIKELY( schedule_cnt ) ) {
       any_scheduled = 1;
+      if( FD_UNLIKELY( ctx->gravity.g && (microblock_dst->txnp->flags & FD_TXN_P_FLAGS_BUNDLE) ) ) {
+        fd_gravity_on_schedule( ctx->gravity.g, ctx->pack, microblock_dst, schedule_cnt, ctx->pack_idx, fd_clock_tile_now( ctx->clock ) );
+      }
       long  now2   = fd_tickcount();
       ulong tsorig = (ulong)fd_frag_meta_ts_comp( now  ); /* A bound on when we observed execle was idle */
       ulong tspub  = (ulong)fd_frag_meta_ts_comp( now2 );
@@ -826,7 +1157,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
-    remove_ib( ctx );
+    remove_ib( ctx, FD_PACK_END_SLOT_REASON_MICROBLOCK );
 
     return;
   }
@@ -856,6 +1187,7 @@ during_frag( fd_pack_ctx_t * ctx,
       memcpy( ctx->executed_txn_sig, fd_txn_get_signatures( TXN(txn_executed->txn), txn_executed->txn->payload ), FD_TXN_SIGNATURE_SZ );
       return;
     }
+    if( FD_UNLIKELY( ctx->gravity.g && gravity_during_replay( ctx, sig, dcache_entry ) ) ) return;
     if( FD_LIKELY( sig!=REPLAY_SIG_BECAME_LEADER ) ) return;
 
     /* There was a leader transition.  Handle it. */
@@ -863,6 +1195,21 @@ during_frag( fd_pack_ctx_t * ctx,
       FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
 
     fd_memcpy( ctx->_became_leader, dcache_entry, sizeof(fd_became_leader_t) );
+    return;
+  }
+  case IN_KIND_EXECLE_POH: {
+    /* Only microblocks of relay mini-block nodes matter */
+    ctx->gravity.exec_cnt = 0UL;
+    if( FD_LIKELY( !fd_gravity_is_inflight( ctx->gravity.g, (uint)fd_disco_execle_sig_pack_idx( sig ) ) ) ) return;
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz<sizeof(fd_microblock_trailer_t) || sz>MAX_MICROBLOCK_SZ ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+    fd_txn_p_t const * txns = (fd_txn_p_t const *)dcache_entry;
+    ulong txn_cnt = fd_ulong_min( (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t), FD_PACK_MAX_TXN_PER_BUNDLE );
+    for( ulong i=0UL; i<txn_cnt; i++ ) {
+      ctx->gravity.exec_flags[ i ] = txns[ i ].flags;
+      ctx->gravity.exec_cus  [ i ] = txns[ i ].execle_cu.actual_consumed_cus;
+    }
+    ctx->gravity.exec_cnt = txn_cnt;
     return;
   }
   case IN_KIND_EXECLE: {
@@ -988,7 +1335,15 @@ after_frag( fd_pack_ctx_t *     ctx,
 
   ulong leader_slot = ULONG_MAX;
   switch( ctx->in_kind[ in_idx ] ) {
+    case IN_KIND_EXECLE_POH:
+      if( FD_UNLIKELY( ctx->gravity.exec_cnt ) ) {
+        fd_gravity_on_executed( ctx->gravity.g, fd_disco_execle_sig_slot( sig ), (uint)fd_disco_execle_sig_pack_idx( sig ),
+                                ctx->gravity.exec_cnt, ctx->gravity.exec_flags, ctx->gravity.exec_cus,
+                                ctx->gravity.in_worker[ in_idx ], fd_clock_tile_now( ctx->clock ) );
+      }
+      return;
     case IN_KIND_REPLAY:
+      if( FD_UNLIKELY( ctx->gravity.g ) ) gravity_after_replay( ctx, sig );
       if( FD_LIKELY( sig==REPLAY_SIG_TXN_EXECUTED && ctx->txn_committed ) ) {
         ulong deleted = fd_pack_delete_transaction( ctx->pack, fd_type_pun( ctx->executed_txn_sig ) );
         FD_MCNT_INC( PACK, TXN_DROPPED_ALREADY_EXECUTED, deleted );
@@ -1010,7 +1365,7 @@ after_frag( fd_pack_ctx_t *     ctx,
         ctx->drain_execle        = 1;
         ctx->leader_slot         = ULONG_MAX;
         ctx->slot_microblock_cnt = 0UL;
-        remove_ib( ctx );
+        remove_ib( ctx, FD_PACK_END_SLOT_REASON_ABANDONED );
 
         update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
         update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
@@ -1048,7 +1403,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->drain_execle        = 1;
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
-      remove_ib( ctx );
+      remove_ib( ctx, FD_PACK_END_SLOT_REASON_ABANDONED );
     }
     ctx->leader_slot = leader_slot;
     ctx->block_height = ctx->_became_leader->block_height;
@@ -1114,14 +1469,20 @@ after_frag( fd_pack_ctx_t *     ctx,
     fd_pack_set_block_limits( ctx->pack, limits );
     fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
 
+    if( FD_UNLIKELY( ctx->gravity.g ) ) gravity_became_leader( ctx, now_ns );
     break;
   }
   case IN_KIND_EXECLE: {
     /* For a previous slot */
     if( FD_UNLIKELY( sig!=ctx->leader_slot ) ) return;
 
+    int ib_failed = ctx->rebate->rebate->ib_result<0;
     fd_pack_rebate_cus( ctx->pack, ctx->rebate->rebate );
-    if( FD_UNLIKELY( ctx->rebate->rebate->ib_result<0 ) ) FD_LOG_WARNING(( "initializer bundle failed in leader slot %lu; no bundles until the slot ends", ctx->leader_slot ));
+    if( FD_UNLIKELY( ib_failed ) ) {
+      /* gravity_ib_failed lets the relay lane run without the crank */
+      if( ctx->gravity.g && fd_gravity_mode( ctx->gravity.g )==FD_GRAVITY_MODE_GRAVITY ) gravity_ib_failed( ctx );
+      else FD_LOG_WARNING(( "initializer bundle failed in leader slot %lu; no bundles until the slot ends", ctx->leader_slot ));
+    }
     ctx->pending_rebate_sz = 0UL;
     fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
     break;
@@ -1131,17 +1492,25 @@ after_frag( fd_pack_ctx_t *     ctx,
     if( FD_UNLIKELY( ctx->is_bundle ) ) {
       if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) return;
       if( FD_UNLIKELY( ++(ctx->current_bundle->txn_received)==ctx->current_bundle->txn_cnt ) ) {
-        ulong deleted;
-        long insert_duration = -fd_tickcount();
-        int result = fd_pack_insert_bundle_fini( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt, ctx->current_bundle->min_blockhash_height, 0, ctx->blk_engine_cfg, &deleted );
-        insert_duration      += fd_tickcount();
-        FD_MCNT_INC( PACK, TXN_EVICTED, deleted );
-        ctx->insert_result[ result + FD_PACK_INSERT_RETVAL_OFF ] += ctx->current_bundle->txn_received;
-        fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
+        if( FD_UNLIKELY( ctx->gravity.g && fd_gravity_on_bundle( ctx->gravity.g, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt,
+                                                                 ctx->current_bundle->min_blockhash_height, ctx->blk_engine_cfg,
+                                                                 fd_clock_tile_now( ctx->clock ) ) ) ) {
+          /* Forwarded to the relay: runs as part of its mini-blocks */
+          fd_pack_insert_bundle_cancel( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt );
+        } else {
+          ulong deleted;
+          long insert_duration = -fd_tickcount();
+          int result = fd_pack_insert_bundle_fini( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt, ctx->current_bundle->min_blockhash_height, 0, ctx->blk_engine_cfg, &deleted );
+          insert_duration      += fd_tickcount();
+          FD_MCNT_INC( PACK, TXN_EVICTED, deleted );
+          ctx->insert_result[ result + FD_PACK_INSERT_RETVAL_OFF ] += ctx->current_bundle->txn_received;
+          fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
+        }
         ctx->current_bundle->bundle = NULL;
       }
     } else {
       ulong blockhash_height = sig;
+      if( FD_UNLIKELY( ctx->gravity.g ) ) fd_gravity_on_txn( ctx->gravity.g, ctx->cur_spot, blockhash_height, fd_clock_tile_now( ctx->clock ) );
       ulong deleted;
       long insert_duration = -fd_tickcount();
       int result = fd_pack_insert_txn_fini( ctx->pack, ctx->cur_spot, blockhash_height, &deleted );
@@ -1173,6 +1542,11 @@ privileged_init( fd_topo_t const *      topo,
   }
   if( FD_UNLIKELY( !fd_rng_secure( &ctx->rng_idx, sizeof(ulong) ) ) ) {
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
+  }
+
+  if( FD_UNLIKELY( tile->pack.gravity.enabled ) ) {
+    uchar const * identity_key = fd_keyload_load( tile->pack.gravity.identity_key_path, /* pubkey only: */ 1 );
+    fd_memcpy( ctx->gravity.identity, identity_key, 32UL );
   }
 
   if( FD_LIKELY( !tile->pack.bundle.enabled ) ) return;
@@ -1234,17 +1608,30 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_pack_set_block_limits( ctx->pack, limits_lower );
 
+  fd_gravity_cfg_t gravity_cfg_[1];
+  void * gravity_mem = NULL;
+  if( FD_UNLIKELY( tile->pack.gravity.enabled ) ) {
+    gravity_cfg( tile, ctx->gravity.identity, gravity_cfg_ );
+    gravity_mem = FD_SCRATCH_ALLOC_APPEND( l, fd_gravity_align(), fd_gravity_footprint( gravity_cfg_ ) );
+  }
+
   ulong in_max = sizeof(ctx->in)/sizeof(ctx->in[0]);
   if( FD_UNLIKELY( tile->in_cnt>in_max ) )
     FD_LOG_ERR(( "Too many input links (%lu>%lu) to pack tile", tile->in_cnt, in_max ));
   FD_TEST( in_max==sizeof(ctx->in_kind)/sizeof(ctx->in_kind[0]) );
+  /* The stem numbers ins skipping unpolled links (e.g. sign_pack, which
+     the keyguard client reads directly), so index by polled link. */
+  ulong polled_in_cnt = 0UL;
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    if( FD_UNLIKELY( !tile->in_link_poll[ i ] ) ) continue;
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
+    ulong j = polled_in_cnt++;
 
-    if( FD_LIKELY(      !strcmp( link->name, "resolv_pack"  ) ) ) ctx->in_kind[ i ] = IN_KIND_RESOLV;
-    else if( FD_LIKELY( !strcmp( link->name, "execle_pack"  ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECLE;
-    else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
-    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
+    if( FD_LIKELY(      !strcmp( link->name, "resolv_pack"  ) ) ) ctx->in_kind[ j ] = IN_KIND_RESOLV;
+    else if( FD_LIKELY( !strcmp( link->name, "execle_pack"  ) ) ) ctx->in_kind[ j ] = IN_KIND_EXECLE;
+    else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ j ] = IN_KIND_SIGN;
+    else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ j ] = IN_KIND_REPLAY;
+    else if( FD_LIKELY( !strcmp( link->name, "execle_poh"   ) ) ) { ctx->in_kind[ j ] = IN_KIND_EXECLE_POH; ctx->gravity.in_worker[ j ] = (uchar)link->kind_id; }
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 
@@ -1304,6 +1691,9 @@ unprivileged_init( fd_topo_t const *      topo,
     memset( ctx->crank, '\0', sizeof(ctx->crank) );
   }
 
+  ctx->gravity.g = NULL;
+  if( FD_UNLIKELY( tile->pack.gravity.enabled ) ) gravity_init( ctx, topo, tile, gravity_mem, gravity_cfg_ );
+
 
   ctx->cur_spot                      = NULL;
   ctx->is_bundle                     = 0;
@@ -1348,13 +1738,16 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ULONG_MAX==fd_fseq_query( ctx->execle_current[ i ] ) );
   }
 
+  polled_in_cnt = 0UL;
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    if( FD_UNLIKELY( !tile->in_link_poll[ i ] ) ) continue;
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t const * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
+    ulong j = polled_in_cnt++;
 
-    ctx->in[ i ].mem    = link_wksp->wksp;
-    ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].mem, link->dcache );
-    ctx->in[ i ].wmark  = fd_dcache_compact_wmark ( ctx->in[ i ].mem, link->dcache, link->mtu );
+    ctx->in[ j ].mem    = link_wksp->wksp;
+    ctx->in[ j ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ j ].mem, link->dcache );
+    ctx->in[ j ].wmark  = fd_dcache_compact_wmark ( ctx->in[ j ].mem, link->dcache, link->mtu );
   }
 
   char const * execle_out_name = fd_topo_find_tile_out_link( topo, tile, "pack_execle", 0UL )!=ULONG_MAX ? "pack_execle" : "pack_bank";
@@ -1405,10 +1798,20 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
                           ulong                  out_cnt,
                           struct sock_filter *   out ) {
   (void)topo;
-  (void)tile;
 
-  populate_sock_filter_policy_fd_pack_tile( out_cnt, out, (uint)fd_log_private_logfile_fd() );
+  /* A pack tile without gravity can't create a socket: no address
+     family matches UINT_MAX. */
+  uint gravity_af = tile->pack.gravity.enabled ? (uint)AF_INET : UINT_MAX;
+  populate_sock_filter_policy_fd_pack_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), gravity_af );
   return sock_filter_policy_fd_pack_tile_instr_cnt;
+}
+
+static ulong
+rlimit_file_cnt( fd_topo_t const *      topo FD_PARAM_UNUSED,
+                 fd_topo_tile_t const * tile ) {
+  /* RLIMIT_NOFILE bounds fd numbers: stderr (2), the log file and the
+   gravity relay socket, with headroom. */
+  return tile->pack.gravity.enabled ? 16UL : 0UL;
 }
 
 static ulong
@@ -1476,6 +1879,11 @@ fd_topo_run_tile_t fd_tile_pack = {
   .name                     = "pack",
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .populate_allowed_fds     = populate_allowed_fds,
+  .rlimit_file_cnt_fn       = rlimit_file_cnt,
+  /* Static per tile type.  Without gravity, the seccomp policy and file
+     limit still prevent pack from creating a socket. */
+  .keep_host_networking     = 1,
+  .allow_connect            = 1,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
   .privileged_init          = privileged_init,
