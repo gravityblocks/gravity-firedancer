@@ -381,6 +381,21 @@ fd_keyguard_payload_matches_bundle( uchar const * data,
   return 1;
 }
 
+/* The Gravity relay bootstrap proof signs
+   "SOLGTC01" || identity[32] || challenge[32].  'S' (83) as a
+   transaction message's required signature count is impossible in 72
+   bytes, so this can't be confused with a transaction message. */
+
+FD_FN_PURE int
+fd_keyguard_payload_matches_gravity( uchar const * data,
+                                     ulong         sz,
+                                     int           sign_type ) {
+  if( sz!=72UL ) return 0;
+  if( sign_type!=FD_KEYGUARD_SIGN_TYPE_ED25519 ) return 0;
+  if( 0!=memcmp( data, "SOLGTC01", 8UL ) ) return 0;
+  return 1;
+}
+
 FD_FN_PURE int
 fd_keyguard_payload_matches_event( uchar const * data,
                                    ulong         sz,
@@ -444,5 +459,6 @@ fd_keyguard_payload_match( uchar const * data,
   res |= fd_ulong_if( fd_keyguard_payload_matches_bls_pubkey  ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_BLS_PUBKEY,   0 );
   res |= fd_ulong_if( fd_keyguard_payload_matches_tower       ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_TOWER,        0 );
   res |= fd_ulong_if( fd_keyguard_payload_matches_vote_history( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_VOTE_HISTORY, 0 );
+  res |= fd_ulong_if( fd_keyguard_payload_matches_gravity     ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_GRAVITY,      0 );
   return res;
 }

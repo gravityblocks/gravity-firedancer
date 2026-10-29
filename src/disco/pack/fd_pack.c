@@ -3132,6 +3132,23 @@ fd_pack_delete_transaction( fd_pack_t              * pack,
   return cnt;
 }
 
+ulong
+fd_pack_delete_bundles( fd_pack_t * pack ) {
+  ulong cnt = 0UL;
+  for(;;) {
+    /* An initializer bundle is at the front.  Deleting restructures the
+       treap, so start over after each bundle. */
+    fd_pack_ord_txn_t * victim = NULL;
+    for( treap_rev_iter_t _cur=treap_rev_iter_init( pack->pending_bundles, pack->pool );
+         !treap_rev_iter_done( _cur ); _cur=treap_rev_iter_next( _cur, pack->pool ) ) {
+      fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pack->pool );
+      if( FD_LIKELY( !(cur->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE) ) ) { victim = cur; break; }
+    }
+    if( FD_LIKELY( !victim ) ) return cnt;
+    cnt += delete_transaction( pack, victim, 1, 0 );
+  }
+}
+
 
 int
 fd_pack_verify( fd_pack_t * pack,

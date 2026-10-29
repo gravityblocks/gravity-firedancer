@@ -32,7 +32,7 @@ FD_STATIC_ASSERT( FD_KEYGUARD_AUTH_VOTERS_MAX<=16UL, auth_voters_max_fits_sign_r
 #define FD_KEYGUARD_ROLE_REPAIR       (4)  /* Repair tile */
 #define FD_KEYGUARD_ROLE_BUNDLE       (5)  /* Bundle tile */
 #define FD_KEYGUARD_ROLE_EVENT        (6)  /* Event tile */
-#define FD_KEYGUARD_ROLE_BUNDLE_CRANK (7)  /* Sign cranking transactions for bundle tips */
+#define FD_KEYGUARD_ROLE_BUNDLE_CRANK (7)  /* Pack tile (bundle tip cranking transactions, Gravity relay authentication) */
 #define FD_KEYGUARD_ROLE_RSERVE       (8)  /* Repair server tile */
 #define FD_KEYGUARD_ROLE_VOTOR        (9)  /* Alpenglow votor tile (QUIC TLS, vote history file) */
 #define FD_KEYGUARD_ROLE_TOWER        (10) /* Tower tile (tower file) */
@@ -54,6 +54,7 @@ FD_STATIC_ASSERT( FD_KEYGUARD_AUTH_VOTERS_MAX<=16UL, auth_voters_max_fits_sign_r
 #define FD_KEYGUARD_PAYLOAD_LG_BLS_PUBKEY   (12)  /* Alpenglow BLS public key query */
 #define FD_KEYGUARD_PAYLOAD_LG_TOWER        (13)  /* Tower file */
 #define FD_KEYGUARD_PAYLOAD_LG_VOTE_HISTORY (14)  /* Alpenglow vote history file */
+#define FD_KEYGUARD_PAYLOAD_LG_GRAVITY      (15)  /* Gravity relay authentication */
 
 #define FD_KEYGUARD_PAYLOAD_TXN          (1UL<<FD_KEYGUARD_PAYLOAD_LG_TXN         )
 #define FD_KEYGUARD_PAYLOAD_GOSSIP       (1UL<<FD_KEYGUARD_PAYLOAD_LG_GOSSIP      )
@@ -69,6 +70,7 @@ FD_STATIC_ASSERT( FD_KEYGUARD_AUTH_VOTERS_MAX<=16UL, auth_voters_max_fits_sign_r
 #define FD_KEYGUARD_PAYLOAD_BLS_PUBKEY   (1UL<<FD_KEYGUARD_PAYLOAD_LG_BLS_PUBKEY  )
 #define FD_KEYGUARD_PAYLOAD_TOWER        (1UL<<FD_KEYGUARD_PAYLOAD_LG_TOWER       )
 #define FD_KEYGUARD_PAYLOAD_VOTE_HISTORY (1UL<<FD_KEYGUARD_PAYLOAD_LG_VOTE_HISTORY)
+#define FD_KEYGUARD_PAYLOAD_GRAVITY      (1UL<<FD_KEYGUARD_PAYLOAD_LG_GRAVITY     )
 
 /* Sign types *********************************************************/
 

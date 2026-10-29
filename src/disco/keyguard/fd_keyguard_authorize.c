@@ -452,6 +452,9 @@ fd_keyguard_payload_authorize( fd_keyguard_authority_t const * authority,
     return 1;
 
   case FD_KEYGUARD_ROLE_BUNDLE_CRANK:
+    /* Pack also authenticates to a Gravity relay.  The identity bytes
+       are not checked, so an identity switch can't race this. */
+    if( payload_mask==FD_KEYGUARD_PAYLOAD_GRAVITY ) return 1;
     if( FD_UNLIKELY( payload_mask != FD_KEYGUARD_PAYLOAD_TXN ) ) {
       FD_LOG_WARNING(( "unauthorized payload type for crank bundle (mask=%#lx)", payload_mask ));
       return 0;

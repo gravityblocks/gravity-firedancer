@@ -340,6 +340,34 @@ test_vote_history_authorize( void ) {
   FD_TEST( !fd_keyguard_payload_authorize( &authority, body, 133UL, FD_KEYGUARD_ROLE_VOTOR, FD_KEYGUARD_SIGN_TYPE_ED25519 ) );
 }
 
+static void
+test_gravity_authorize( void ) {
+  /* The Gravity relay bootstrap proof: "SOLGTC01" || identity || challenge */
+  uchar msg[ 80 ];
+  memcpy( msg, "SOLGTC01", 8UL );
+  memset( msg+8UL,  0xAA, 32UL );
+  memset( msg+40UL, 0x01, 40UL );
+  fd_keyguard_authority_t authority;
+  memset( &authority, 0xBB, sizeof(authority) );
+
+  FD_TEST(  fd_keyguard_payload_match( msg, 72UL, FD_KEYGUARD_SIGN_TYPE_ED25519        )==FD_KEYGUARD_PAYLOAD_GRAVITY );
+  FD_TEST( !( fd_keyguard_payload_match( msg, 71UL, FD_KEYGUARD_SIGN_TYPE_ED25519        ) & FD_KEYGUARD_PAYLOAD_GRAVITY ) );
+  FD_TEST( !( fd_keyguard_payload_match( msg, 73UL, FD_KEYGUARD_SIGN_TYPE_ED25519        ) & FD_KEYGUARD_PAYLOAD_GRAVITY ) );
+  FD_TEST( !( fd_keyguard_payload_match( msg, 72UL, FD_KEYGUARD_SIGN_TYPE_SHA256_ED25519 ) & FD_KEYGUARD_PAYLOAD_GRAVITY ) );
+  msg[ 7 ] = '2';
+  FD_TEST( !( fd_keyguard_payload_match( msg, 72UL, FD_KEYGUARD_SIGN_TYPE_ED25519        ) & FD_KEYGUARD_PAYLOAD_GRAVITY ) );
+  msg[ 7 ] = '1';
+
+  /* Only pack signs it, for any identity (pack may sign for the new
+     identity before the sign tile switched) */
+  FD_TEST(  fd_keyguard_payload_authorize( &authority, msg, 72UL, FD_KEYGUARD_ROLE_BUNDLE_CRANK, FD_KEYGUARD_SIGN_TYPE_ED25519        ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, msg, 72UL, FD_KEYGUARD_ROLE_BUNDLE_CRANK, FD_KEYGUARD_SIGN_TYPE_SHA256_ED25519 ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, msg, 72UL, FD_KEYGUARD_ROLE_BUNDLE,       FD_KEYGUARD_SIGN_TYPE_ED25519        ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, msg, 72UL, FD_KEYGUARD_ROLE_GOSSIP,       FD_KEYGUARD_SIGN_TYPE_ED25519        ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, msg, 72UL, FD_KEYGUARD_ROLE_TXSEND,       FD_KEYGUARD_SIGN_TYPE_ED25519        ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, msg, 71UL, FD_KEYGUARD_ROLE_BUNDLE_CRANK, FD_KEYGUARD_SIGN_TYPE_ED25519        ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -351,6 +379,7 @@ main( int     argc,
   test_tower_authorize();
   test_tower_match();
   test_vote_history_authorize();
+  test_gravity_authorize();
   FD_LOG_NOTICE(( "pass" ));
   return 0;
 }

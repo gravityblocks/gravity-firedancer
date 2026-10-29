@@ -329,7 +329,8 @@ fd_topo_initialize( config_t * config ) {
     resolv_tile_cnt = 0UL;
     quic_tile_cnt   = 0UL;
     verify_tile_cnt = 0UL;
-    config->tiles.bundle.enabled = 0;
+    config->tiles.bundle.enabled  = 0;
+    config->tiles.gravity.enabled = 0;
   }
   fd_topob_wksp( topo, "metric_in"    );
   if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "diag_gui" );
@@ -614,7 +615,7 @@ fd_topo_initialize( config_t * config ) {
     FOR(verify_tile_cnt) fd_topob_tile( topo, "verify",  "verify",  "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,               0,               0 );
     /**/                 fd_topob_tile( topo, "dedup",   "dedup",   "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,               0,               0 );
     FOR(resolv_tile_cnt) fd_topob_tile( topo, "resolv",  "resolv",  "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,               0,               0 );
-    /**/                 fd_topob_tile( topo, "pack",    "pack",    "metric_in",  tile_to_cpu[ topo->tile_cnt ], config->tiles.bundle.enabled, 0, 0 );
+    /**/                 fd_topob_tile( topo, "pack",    "pack",    "metric_in",  tile_to_cpu[ topo->tile_cnt ], config->tiles.bundle.enabled || config->tiles.gravity.enabled, 0, 0 );
     FOR(execle_tile_cnt) fd_topob_tile( topo, "execle",  "execle",  "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,               0,               0 );
     /**/                 fd_topob_tile( topo, "motor",   "motor",   "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,               0,               0 );
   }
@@ -856,6 +857,26 @@ fd_topo_initialize( config_t * config ) {
       fd_topob_link( topo, "bundle_status", "bundle_status", 128UL, sizeof(fd_bundle_block_engine_update_t), 1UL );
       fd_topob_tile_out( topo, "bundle", 0UL, "bundle_status", 0UL );
     }
+  }
+
+  /* With Gravity, pack signs the relay authentication with the identity
+     key (over the bundle tile's pack_sign link if that is enabled), and
+     reads execution results of relay mini-blocks from the execle
+     output.  The execle taps never back-pressure execle. */
+  if( FD_UNLIKELY( leader_enabled && config->tiles.gravity.enabled ) ) {
+    if( FD_LIKELY( !config->tiles.bundle.enabled ) ) {
+      fd_topob_wksp( topo, "pack_sign" );
+      fd_topob_wksp( topo, "sign_pack" );
+
+      /**/               fd_topob_link( topo, "pack_sign",    "pack_sign",    65536UL,                                  1232UL,                    1UL );
+      /**/               fd_topob_link( topo, "sign_pack",    "sign_pack",    128UL,                                    64UL,                      1UL );
+
+      /**/               fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "pack_sign",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+      /**/               fd_topob_tile_out( topo, "pack",   0UL,                        "pack_sign",      0UL                                                );
+      /**/               fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+      /**/               fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
+    }
+    FOR(execle_tile_cnt) fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "execle_poh",     i,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   }
 
   /* Sign links don't need to be reliable because each requester has a
@@ -1735,6 +1756,38 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       fd_cstr_ncpy( tile->pack.bundle.vote_account_path, config->paths.vote_account, sizeof(tile->pack.bundle.vote_account_path) );
     } else {
       fd_memset( &tile->pack.bundle, '\0', sizeof(tile->pack.bundle) );
+    }
+
+    fd_memset( &tile->pack.gravity, '\0', sizeof(tile->pack.gravity) );
+    if( FD_UNLIKELY( config->tiles.gravity.enabled ) ) {
+      tile->pack.gravity.enabled   = 1;
+      tile->pack.gravity.relay_cnt = config->tiles.gravity.relays_cnt;
+      for( ulong i=0UL; i<config->tiles.gravity.relays_cnt; i++ ) {
+        char host[ FD_HOSTPORT_BUF_MAX ];
+        fd_cstr_ncpy( host, config->tiles.gravity.relays[ i ], sizeof(host) );
+        char * colon = strrchr( host, ':' );
+        char * end;
+        ulong  port  = colon ? strtoul( colon+1, &end, 10 ) : 0UL;
+        if( FD_UNLIKELY( !colon || *end || !port || port>USHORT_MAX ) ) FD_LOG_ERR(( "[tiles.gravity.relays] entry `%s` must be \"ip:port\"", config->tiles.gravity.relays[ i ] ));
+        *colon = '\0';
+        if( FD_UNLIKELY( !fd_cstr_to_ip4_addr( host, &tile->pack.gravity.relay_ip4[ i ] ) ) ) FD_LOG_ERR(( "[tiles.gravity.relays] entry `%s` must be an IPv4 literal", config->tiles.gravity.relays[ i ] ));
+        tile->pack.gravity.relay_port[ i ] = (ushort)port;
+      }
+      fd_cstr_ncpy( tile->pack.gravity.identity_key_path, config->paths.identity_key, sizeof(tile->pack.gravity.identity_key_path) );
+      tile->pack.gravity.retention_sz        = (ulong)config->tiles.gravity.retention_buffer_mib<<20;
+      tile->pack.gravity.rx_max              = (ulong)config->tiles.gravity.receive_buffer_mib<<20;
+      tile->pack.gravity.tx_max              = (ulong)config->tiles.gravity.send_buffer_mib<<20;
+      tile->pack.gravity.node_max            = config->tiles.gravity.max_lane_nodes;
+      tile->pack.gravity.filter_ofac         = config->tiles.gravity.filter_ofac;
+      tile->pack.gravity.jito_tip_weight_bps = (ushort)config->tiles.gravity.jito_tip_weight_bps;
+      /* source_uri of forwarded Jito bundles, which the relay limits to 64
+         bytes: the block engine url if it fits and is ASCII */
+      if( config->tiles.bundle.enabled ) {
+        ulong len = strlen( config->tiles.bundle.url );
+        int   ok  = len<=64UL;
+        for( ulong i=0UL; ok && i<len; i++ ) ok = (uchar)config->tiles.bundle.url[ i ]<0x80U;
+        if( ok ) fd_cstr_ncpy( tile->pack.gravity.bundle_uri, config->tiles.bundle.url, sizeof(tile->pack.gravity.bundle_uri) );
+      }
     }
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "execle" ) ) ) {

@@ -618,6 +618,17 @@ fd_config_validate( fd_config_t const * config ) {
 
   CFG_HAS_POW2( tiles.repair.slot_max );
 
+  if( FD_UNLIKELY( config->tiles.gravity.enabled ) ) {
+    /* The tip crank's initializer bundle only completes with execle rebates */
+    if( FD_UNLIKELY( config->tiles.bundle.enabled && !config->tiles.pack.use_consumed_cus ) ) FD_LOG_ERR(( "`tiles.gravity` together with `tiles.bundle` requires `tiles.pack.use_consumed_cus`" ));
+    if( FD_UNLIKELY( !config->tiles.gravity.relays_cnt ) ) FD_LOG_ERR(( "`tiles.gravity.enabled` is true but `tiles.gravity.relays` is empty" ));
+    if( FD_UNLIKELY( config->tiles.gravity.jito_tip_weight_bps>10000U ) ) FD_LOG_ERR(( "`tiles.gravity.jito_tip_weight_bps` must be in [0,10000]" ));
+    if( FD_UNLIKELY( !config->tiles.gravity.retention_buffer_mib || config->tiles.gravity.retention_buffer_mib>65536U ) ) FD_LOG_ERR(( "`tiles.gravity.retention_buffer_mib` must be in [1,65536]" ));
+    if( FD_UNLIKELY( !config->tiles.gravity.receive_buffer_mib || config->tiles.gravity.receive_buffer_mib>64U ) ) FD_LOG_ERR(( "`tiles.gravity.receive_buffer_mib` must be in [1,64]" ));
+    if( FD_UNLIKELY( !config->tiles.gravity.send_buffer_mib || config->tiles.gravity.send_buffer_mib>64U ) ) FD_LOG_ERR(( "`tiles.gravity.send_buffer_mib` must be in [1,64]" ));
+    if( FD_UNLIKELY( !config->tiles.gravity.max_lane_nodes || config->tiles.gravity.max_lane_nodes>(1U<<20) ) ) FD_LOG_ERR(( "`tiles.gravity.max_lane_nodes` must be in [1,1048576]" ));
+  }
+
   if( FD_UNLIKELY( config->tiles.bundle.keepalive_interval_millis <    3000 ||
                    config->tiles.bundle.keepalive_interval_millis > 3600000 ) ) {
     FD_LOG_ERR(( "`tiles.bundle.keepalive_interval_millis` must be in range [3000, 3,600,000]" ));
