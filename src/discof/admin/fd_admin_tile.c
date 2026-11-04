@@ -438,6 +438,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
         if( strcmp( tile->name, "rotor" ) &&
             strcmp( tile->name, "gossip" ) &&
             strcmp( tile->name, "bundle" ) &&
+            strcmp( tile->name, "gbx" ) &&
             strcmp( tile->name, "rserve" ) &&
             strcmp( tile->name, "shred"  ) ) {
           continue;
@@ -462,6 +463,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
         if( strcmp( tile->name, "rotor" ) &&
             strcmp( tile->name, "gossip" ) &&
             strcmp( tile->name, "bundle" ) &&
+            strcmp( tile->name, "gbx" ) &&
             strcmp( tile->name, "rserve" ) &&
             strcmp( tile->name, "shred"  ) ) {
           continue;
@@ -510,6 +512,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
                        !strcmp( tile->name, "gossip" ) ||
                        !strcmp( tile->name, "votor" ) ||
                        !strcmp( tile->name, "bundle" ) ||
+                       !strcmp( tile->name, "gbx" ) ||
                        !strcmp( tile->name, "rserve" ) ||
                        !strcmp( tile->name, "shred"  ) ) ) continue;
 
@@ -535,6 +538,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
                        !strcmp( tile->name, "gossip" ) ||
                        !strcmp( tile->name, "votor"  ) ||
                        !strcmp( tile->name, "bundle" ) ||
+                       !strcmp( tile->name, "gbx" ) ||
                        !strcmp( tile->name, "rserve" ) ||
                        !strcmp( tile->name, "shred"  ) ) ) continue;
 
@@ -570,6 +574,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
             strcmp( tile->name, "gossip" ) &&
             strcmp( tile->name, "votor" ) &&
             strcmp( tile->name, "bundle" ) &&
+            strcmp( tile->name, "gbx" ) &&
             strcmp( tile->name, "rserve" ) ) {
           continue;
         }
@@ -594,6 +599,7 @@ poll_set_identity( fd_admin_tile_ctx_t * ctx,
             strcmp( tile->name, "gossip" ) &&
             strcmp( tile->name, "votor" ) &&
             strcmp( tile->name, "bundle" ) &&
+            strcmp( tile->name, "gbx" ) &&
             strcmp( tile->name, "rserve" ) ) {
           continue;
         }

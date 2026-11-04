@@ -32,6 +32,7 @@ static struct { char const * name; uint flags; } const TILE_CLASS[] = {
   { "sock",   ALWAYS|PIN_EFF               },
   { "quic",   ALWAYS                       },
   { "bundle", ALWAYS                       },
+  { "gbx",    ALWAYS                       },
   { "verify", ALWAYS|THRUPUT               },
   { "dedup",  ALWAYS                       },
   { "resolv", ALWAYS                       },

@@ -10,6 +10,9 @@
 #include "../alpenglow/fd_alpenglow.h"
 #include "../rewards/fd_epoch_inflation_account.h"
 #include "../../ballet/sha256/fd_sha256.h"
+#include "../../ballet/base58/fd_base58.h" /* TEST ONLY memo */
+
+FD_IMPORT_BINARY( test_memo_elf, "/home/nikita/dev/agave/program-binaries/src/programs/spl_memo-3.0.0.so" ); /* TEST ONLY memo */
 
 /* https://github.com/anza-xyz/agave/blob/v4.2.0-beta.1/genesis/src/main.rs#L69 */
 #define FD_GENESIS_VAT_MINIMUM_LAMPORTS (1600000000UL*100UL)
@@ -446,6 +449,8 @@ genesis_create( void *                       buf,
   ulong alpenglow_idx = genesis->accounts_len;
   REQUIRE( !__builtin_add_overflow( genesis->accounts_len, 2UL, &genesis->accounts_len ) );
 
+  ulong test_memo_idx = genesis->accounts_len++; /* TEST ONLY memo */
+
   ulong accounts_sz;
   REQUIRE( !__builtin_mul_overflow( genesis->accounts_len, sizeof(fd_genesis_account_pair_t), &accounts_sz ) );
   REQUIRE( fd_scratch_alloc_is_safe( alignof(fd_genesis_account_pair_t), accounts_sz ) );
@@ -668,6 +673,20 @@ genesis_create( void *                       buf,
 
     REQUIRE( token_idx==alpenglow_idx );
   }
+
+  /* TEST ONLY memo: SPL Memo, which the Jito tip crank calls */
+  fd_pubkey_t test_memo_key;
+  REQUIRE( fd_base58_decode_32( "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", test_memo_key.uc ) );
+  genesis->accounts[ test_memo_idx ] = (fd_genesis_account_pair_t) {
+    .key     = test_memo_key,
+    .account = (fd_genesis_account_t) {
+      .lamports   = fd_rent_exempt_minimum_balance( &genesis->rent, test_memo_elf_sz ),
+      .data_len   = test_memo_elf_sz,
+      .data       = (uchar *)test_memo_elf,
+      .owner      = fd_solana_bpf_loader_program_id,
+      .executable = 1
+    }
+  };
 
   /* Sort and check for duplicates */
 
