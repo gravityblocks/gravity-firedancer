@@ -15,6 +15,7 @@
 #include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
 #include "../fd_clock_tile.h"
+#include "../../discof/gravity/fd_gravity.h" // layering violation
 
 #include <string.h>
 
@@ -30,6 +31,7 @@
 #define IN_KIND_SIGN         (3UL)
 #define IN_KIND_REPLAY       (4UL)
 #define IN_KIND_EXECUTED_TXN (5UL)
+#define IN_KIND_GRAVITY      (6UL)
 
 /* Pace microblocks, but only slightly.  This helps keep performance
    more stable.  This limit is 2,000 microblocks/second/execle.  At
@@ -63,6 +65,17 @@ const ulong CUS_PER_MICROBLOCK = 1600000UL;
 
 const float VOTE_FRACTION = 1.0f; /* schedule all available votes first */
 #define EFFECTIVE_TXN_PER_MICROBLOCK 1UL
+
+/* Relay nodes pack can hold at once, and queued run commands.  Both
+   are powers of two.  See fd_gravity.h. */
+#define GRAVITY_NODE_MAX (16384UL)
+#define GRAVITY_RUN_MAX  (256UL)
+
+typedef struct {
+  ulong            id;          /* bundle_id */
+  fd_ed25519_sig_t sig0;
+  uint             pending_idx; /* in gravity->pending, UINT_MAX if not held */
+} gravity_node_t;
 
 
 
@@ -276,6 +289,25 @@ typedef struct {
   } crank[1];
 
 
+  struct {
+    int               enabled;
+    int               active;     /* the current leader slot is relay-built */
+    ulong const *     mode;       /* 1 while the tile allows relay building */
+    ulong             window_end; /* relay-built through this slot */
+    ulong             native_end; /* native through this slot */
+    fd_pack_out_ctx_t out[1];
+
+    ulong             run_head;
+    ulong             run_cnt;
+    ulong             run[ GRAVITY_RUN_MAX ];
+    ulong             staged_cnt;
+    ulong             staged[ GRAVITY_RUN_MAX ];
+
+    ulong             pending_cnt;
+    uint              pending[ GRAVITY_NODE_MAX ];
+    gravity_node_t    node[ GRAVITY_NODE_MAX ];
+  } gravity[1];
+
   /* Used between during_frag and after_frag */
   ulong pending_rebate_sz;
   union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } rebate[1];
@@ -315,6 +347,146 @@ remove_ib( fd_pack_ctx_t * ctx ) {
   ctx->crank->ib_inserted = 0;
 }
 
+
+static void
+gravity_report( fd_pack_ctx_t *     ctx,
+                fd_stem_context_t * stem,
+                ulong               bundle_id,
+                int                 kind,
+                int                 code ) {
+  fd_pack_out_ctx_t * out = ctx->gravity->out;
+  fd_gravity_pack_report_t * report = fd_chunk_to_laddr( out->mem, out->chunk );
+  *report = (fd_gravity_pack_report_t){ .bundle_id = bundle_id, .slot = ctx->leader_slot, .kind = kind, .code = code };
+  fd_stem_publish( stem, out->out_idx, 0UL, out->chunk, sizeof(fd_gravity_pack_report_t), 0UL, 0UL, 0UL );
+  out->chunk = fd_dcache_compact_next( out->chunk, sizeof(fd_gravity_pack_report_t), out->chunk0, out->wmark );
+}
+
+static void
+gravity_unpend( fd_pack_ctx_t *  ctx,
+                gravity_node_t * node ) {
+  uint i    = node->pending_idx;
+  uint last = ctx->gravity->pending[ --ctx->gravity->pending_cnt ];
+  ctx->gravity->pending[ i ]             = last;
+  ctx->gravity->node[ last ].pending_idx = i;
+  node->pending_idx = UINT_MAX;
+}
+
+/* gravity_clear deletes the relay nodes pack still holds and fails the
+   queued run commands. */
+
+static void
+gravity_clear( fd_pack_ctx_t *     ctx,
+               fd_stem_context_t * stem ) {
+  for( ulong i=0UL; i<ctx->gravity->run_cnt; i++ ) {
+    ulong cmd = ctx->gravity->run[ (ctx->gravity->run_head+i) & (GRAVITY_RUN_MAX-1UL) ];
+    gravity_report( ctx, stem, cmd>>1, FD_GRAVITY_REPORT_SCHED_FAIL, FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND );
+  }
+  for( ulong i=0UL; i<ctx->gravity->pending_cnt; i++ ) {
+    gravity_node_t * node = ctx->gravity->node + ctx->gravity->pending[ i ];
+    fd_pack_delete_transaction( ctx->pack, (fd_ed25519_sig_t const *)node->sig0 );
+    node->pending_idx = UINT_MAX;
+  }
+  ctx->gravity->pending_cnt = 0UL;
+  ctx->gravity->run_cnt     = 0UL;
+  ctx->gravity->active      = 0;
+}
+
+/* gravity_crank_failed lets relay nodes run without the crank. */
+
+static void
+gravity_crank_failed( fd_pack_ctx_t * ctx ) {
+  if( !ctx->gravity->active ) return;
+  fd_pack_set_initializer_bundles_ready( ctx->pack );
+}
+
+/* gravity_insert ends the bundle path of after_frag for relay nodes,
+   which are only stored during relay-built slots. */
+
+static void
+gravity_insert( fd_pack_ctx_t *     ctx,
+                fd_stem_context_t * stem ) {
+  if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) return;
+  if( FD_LIKELY( ++(ctx->current_bundle->txn_received)<ctx->current_bundle->txn_cnt ) ) return;
+
+  fd_txn_e_t * const * bundle  = ctx->current_bundle->bundle;
+  ulong                id      = ctx->current_bundle->id;
+  ulong                txn_cnt = ctx->current_bundle->txn_cnt;
+  ctx->current_bundle->bundle = NULL;
+
+  if( FD_UNLIKELY( !ctx->gravity->active ) ) {
+    fd_pack_insert_bundle_cancel( ctx->pack, bundle, txn_cnt );
+    gravity_report( ctx, stem, id, FD_GRAVITY_REPORT_REJECTED, 0 );
+    return;
+  }
+
+  fd_ed25519_sig_t sig0;
+  fd_txn_p_t const * txn0 = bundle[ 0 ]->txnp;
+  fd_memcpy( sig0, txn0->payload+TXN(txn0)->signature_off, FD_TXN_SIGNATURE_SZ );
+
+  ulong deleted;
+  int result = fd_pack_insert_bundle_fini( ctx->pack, bundle, txn_cnt, ctx->current_bundle->min_blockhash_height, 0, ctx->blk_engine_cfg, &deleted );
+  FD_MCNT_INC( PACK, TXN_EVICTED, deleted );
+  ctx->insert_result[ result + FD_PACK_INSERT_RETVAL_OFF ] += txn_cnt;
+  if( FD_UNLIKELY( result<0 ) ) {
+    gravity_report( ctx, stem, id, FD_GRAVITY_REPORT_REJECTED, result );
+    return;
+  }
+
+  /* The tile can no longer run a node still held in this entry. */
+  gravity_node_t * node = ctx->gravity->node + (id & (GRAVITY_NODE_MAX-1UL));
+  if( FD_UNLIKELY( node->pending_idx!=UINT_MAX ) ) {
+    fd_pack_delete_transaction( ctx->pack, (fd_ed25519_sig_t const *)node->sig0 );
+    gravity_unpend( ctx, node );
+  }
+  node->id          = id;
+  node->pending_idx = (uint)ctx->gravity->pending_cnt;
+  fd_memcpy( node->sig0, sig0, FD_TXN_SIGNATURE_SZ );
+  ctx->gravity->pending[ ctx->gravity->pending_cnt++ ] = (uint)(id & (GRAVITY_NODE_MAX-1UL));
+  gravity_report( ctx, stem, id, FD_GRAVITY_REPORT_ADMITTED, result );
+}
+
+/* gravity_schedule replaces fd_pack_schedule_next_microblock during
+   relay-built slots.  It schedules the node at the head of the run
+   queue. */
+
+static ulong
+gravity_schedule( fd_pack_ctx_t *     ctx,
+                  fd_stem_context_t * stem,
+                  ulong               execle,
+                  fd_txn_e_t *        out ) {
+  if( FD_UNLIKELY( !ctx->gravity->run_cnt ) ) return 0UL;
+
+  ulong           cmd  = ctx->gravity->run[ ctx->gravity->run_head & (GRAVITY_RUN_MAX-1UL) ];
+  ulong           id   = cmd>>1;
+  gravity_node_t * node = ctx->gravity->node + (id & (GRAVITY_NODE_MAX-1UL));
+  int held = (node->id==id) & (node->pending_idx!=UINT_MAX);
+  int res  = held ? fd_pack_schedule_bundle( ctx->pack, (fd_ed25519_sig_t const *)node->sig0, execle, out ) : FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND;
+
+  /* Locks free up as outstanding microblocks complete. */
+  if( FD_UNLIKELY( res==FD_PACK_SCHEDULE_BUNDLE_NOT_READY || res==FD_PACK_SCHEDULE_BUNDLE_CONFLICT ) ) return 0UL;
+  if( FD_UNLIKELY( res>0 && (out->txnp->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE) ) ) return (ulong)res; /* the crank went first */
+
+  ctx->gravity->run_head++;
+  ctx->gravity->run_cnt--;
+  if( FD_LIKELY( res>0 ) ) {
+    gravity_unpend( ctx, node );
+    if( cmd & FD_GRAVITY_RUN_LOOSE ) out->txnp->flags &= ~FD_TXN_P_FLAGS_BUNDLE;
+    return (ulong)res;
+  }
+
+  /* Rebates of outstanding microblocks can make room, so retry after
+     the rest of the queue. */
+  if( FD_UNLIKELY( res==FD_PACK_SCHEDULE_BUNDLE_DOES_NOT_FIT && ctx->execle_idle_bitset!=fd_ulong_mask_lsb( (int)ctx->execle_cnt ) ) ) {
+    ctx->gravity->run[ (ctx->gravity->run_head+ctx->gravity->run_cnt++) & (GRAVITY_RUN_MAX-1UL) ] = cmd;
+    return 0UL;
+  }
+  if( held ) {
+    fd_pack_delete_transaction( ctx->pack, (fd_ed25519_sig_t const *)node->sig0 );
+    gravity_unpend( ctx, node );
+  }
+  gravity_report( ctx, stem, id, FD_GRAVITY_REPORT_SCHED_FAIL, res );
+  return 0UL;
+}
 
 FD_FN_CONST static inline ulong
 scratch_align( void ) {
@@ -610,6 +782,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
     remove_ib( ctx );
+    gravity_clear( ctx, stem );
 
     update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
     update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
@@ -642,6 +815,11 @@ after_credit( fd_pack_ctx_t *     ctx,
     return;
   }
 
+  if( FD_UNLIKELY( ctx->gravity->active && fd_fseq_query( ctx->gravity->mode )!=1UL ) ) {
+    gravity_clear( ctx, stem );
+    ctx->gravity->native_end = ctx->gravity->window_end;
+  }
+
   if( FD_UNLIKELY( ctx->pending_reduce_mb_bound ) ) {
     ctx->pending_reduce_mb_bound = 0;
     ulong * dst = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
@@ -662,6 +840,11 @@ after_credit( fd_pack_ctx_t *     ctx,
 
   if( FD_LIKELY( ctx->crank->enabled ) ) {
     block_builder_info_t const * top_meta = fd_pack_peek_bundle_meta( ctx->pack );
+    /* A relay node before the block engine named its block builder */
+    if( FD_UNLIKELY( top_meta && fd_mem_iszero( top_meta->commission_pubkey->b, 32UL ) ) ) {
+      gravity_crank_failed( ctx );
+      top_meta = NULL;
+    }
     if( FD_UNLIKELY( top_meta ) ) {
       /* Have bundles, in a reasonable state to crank. */
 
@@ -698,6 +881,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         if( FD_UNLIKELY( retval<0 ) ) {
           ctx->crank->metrics[ 3 ]++; /* BUNDLE_CRANK_ATTEMPTED_INSERTION_FAILED */
           FD_LOG_WARNING(( "inserting initializer bundle returned %i", retval ));
+          gravity_crank_failed( ctx );
         } else {
           /* Update the cached copy of the on-chain state.  This seems a
              little dangerous, since we're updating it as if the bundle
@@ -724,6 +908,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         /* Already logged a warning in this case */
         fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
         ctx->crank->metrics[ 2 ]++; /* BUNDLE_CRANK_ATTEMPTED_CREATION_FAILED */
+        gravity_crank_failed( ctx );
       }
     }
   }
@@ -756,7 +941,8 @@ after_credit( fd_pack_ctx_t *     ctx,
     fd_pack_out_ctx_t * execle_out = &ctx->execle_out[ i ];
     fd_txn_e_t * microblock_dst = fd_chunk_to_laddr( execle_out->mem, execle_out->chunk );
     long schedule_duration = -fd_tickcount();
-    ulong schedule_cnt = fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, microblock_dst );
+    ulong schedule_cnt = ctx->gravity->active ? gravity_schedule( ctx, stem, (ulong)i, microblock_dst )
+                                              : fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, microblock_dst );
     schedule_duration      += fd_tickcount();
     fd_histf_sample( (schedule_cnt>0UL) ? ctx->schedule_duration : ctx->no_sched_duration, (ulong)schedule_duration );
 
@@ -836,6 +1022,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
     remove_ib( ctx );
+    gravity_clear( ctx, stem );
 
     return;
   }
@@ -896,6 +1083,13 @@ during_frag( fd_pack_ctx_t * ctx,
 
     ctx->pending_rebate_sz = sz;
     fd_memcpy( ctx->rebate, dcache_entry, sz );
+    return;
+  }
+  case IN_KIND_GRAVITY: {
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz>sizeof(ctx->gravity->staged) || sz%sizeof(ulong) ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+    ctx->gravity->staged_cnt = sz/sizeof(ulong);
+    fd_memcpy( ctx->gravity->staged, dcache_entry, sz );
     return;
   }
   case IN_KIND_RESOLV: {
@@ -1035,6 +1229,7 @@ after_frag( fd_pack_ctx_t *     ctx,
         ctx->leader_slot         = ULONG_MAX;
         ctx->slot_microblock_cnt = 0UL;
         remove_ib( ctx );
+        gravity_clear( ctx, stem );
 
         update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
         update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
@@ -1078,6 +1273,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
       remove_ib( ctx );
+      gravity_clear( ctx, stem );
     }
     ctx->leader_slot = leader_slot;
     ctx->block_height = ctx->_became_leader->block_height;
@@ -1130,6 +1326,17 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     update_metric_state( ctx, fd_tickcount(), FD_PACK_METRIC_STATE_LEADER, 1 );
 
+    if( ctx->gravity->enabled ) {
+      if( leader_slot>ctx->gravity->window_end && leader_slot>ctx->gravity->native_end ) {
+        ulong window_end = leader_slot - leader_slot%4UL + 3UL;
+        if( fd_fseq_query( ctx->gravity->mode )==1UL ) ctx->gravity->window_end = window_end;
+        else                                           ctx->gravity->native_end = window_end;
+      }
+      ctx->gravity->active = (leader_slot<=ctx->gravity->window_end) & (leader_slot>ctx->gravity->native_end);
+      gravity_report( ctx, stem, 0UL, FD_GRAVITY_REPORT_MODE, ctx->gravity->active );
+      if( FD_UNLIKELY( ctx->gravity->active & !ctx->crank->enabled ) ) fd_pack_set_initializer_bundles_ready( ctx->pack );
+    }
+
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
     ctx->slot_dynamic_max_microblocks  = ctx->slot_max_microblocks;
     ctx->slot_mixin_per_tick           = fd_ulong_if( ctx->_became_leader->hashcnt_per_tick>1UL, ctx->_became_leader->hashcnt_per_tick-1UL, 0UL ); /* 0: low power / alpenglow, no hash budget */
@@ -1153,11 +1360,27 @@ after_frag( fd_pack_ctx_t *     ctx,
     if( FD_UNLIKELY( sig!=ctx->leader_slot ) ) return;
 
     fd_pack_rebate_cus( ctx->pack, ctx->rebate->rebate );
+    if( FD_UNLIKELY( ctx->rebate->rebate->ib_result<0 ) ) gravity_crank_failed( ctx );
     ctx->pending_rebate_sz = 0UL;
     fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
     break;
   }
+  case IN_KIND_GRAVITY: {
+    for( ulong i=0UL; i<ctx->gravity->staged_cnt; i++ ) {
+      if( FD_UNLIKELY( ctx->gravity->run_cnt==GRAVITY_RUN_MAX || !ctx->gravity->active ) ) {
+        gravity_report( ctx, stem, ctx->gravity->staged[ i ]>>1, FD_GRAVITY_REPORT_SCHED_FAIL, FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND );
+        continue;
+      }
+      ctx->gravity->run[ (ctx->gravity->run_head+ctx->gravity->run_cnt++) & (GRAVITY_RUN_MAX-1UL) ] = ctx->gravity->staged[ i ];
+    }
+    break;
+  }
   case IN_KIND_RESOLV: {
+    if( FD_UNLIKELY( ctx->is_bundle && (ctx->current_bundle->id & FD_GRAVITY_ID_BIT) ) ) {
+      gravity_insert( ctx, stem );
+      ctx->cur_spot = NULL;
+      break;
+    }
     /* Normal transaction case */
     if( FD_UNLIKELY( ctx->is_bundle ) ) {
       if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) return;
@@ -1288,6 +1511,7 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "executed_txn" ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
+    else if( FD_LIKELY( !strcmp( link->name, "gbx_pack"     ) ) ) ctx->in_kind[ i ] = IN_KIND_GRAVITY;
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 
@@ -1422,6 +1646,23 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->poh_out.chunk0 = fd_dcache_compact_chunk0( ctx->poh_out.mem, poh_out_link->dcache );
   ctx->poh_out.wmark  = fd_dcache_compact_wmark ( ctx->poh_out.mem, poh_out_link->dcache, poh_out_link->mtu );
   ctx->poh_out.chunk  = ctx->poh_out.chunk0;
+
+  memset( ctx->gravity, 0, sizeof(ctx->gravity) );
+  for( ulong i=0UL; i<GRAVITY_NODE_MAX; i++ ) ctx->gravity->node[ i ].pending_idx = UINT_MAX;
+  ctx->gravity->out->out_idx = fd_topo_find_tile_out_link( topo, tile, "pack_gbx", 0UL );
+  if( FD_UNLIKELY( ctx->gravity->out->out_idx!=ULONG_MAX ) ) {
+    fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ ctx->gravity->out->out_idx ] ];
+    ctx->gravity->out->mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->gravity->out->chunk0 = fd_dcache_compact_chunk0( ctx->gravity->out->mem, link->dcache );
+    ctx->gravity->out->wmark  = fd_dcache_compact_wmark ( ctx->gravity->out->mem, link->dcache, link->mtu );
+    ctx->gravity->out->chunk  = ctx->gravity->out->chunk0;
+
+    ulong mode_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "gbx_mode" );
+    FD_TEST( mode_obj_id!=ULONG_MAX );
+    ctx->gravity->mode    = fd_fseq_join( fd_topo_obj_laddr( topo, mode_obj_id ) );
+    ctx->gravity->enabled = 1;
+    FD_TEST( ctx->gravity->mode );
+  }
 
   /* Initialize metrics storage */
   memset( ctx->insert_result, '\0', FD_PACK_INSERT_RETVAL_CNT * sizeof(ulong) );

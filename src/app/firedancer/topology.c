@@ -30,6 +30,7 @@
 #include "../../disco/topo/fd_topob.h"
 #include "../../disco/topo/fd_cpu_topo.h"
 #include "../../disco/bundle/fd_bundle_tile.h"
+#include "../../discof/gravity/fd_gravity.h"
 #include "../../tango/dcache/fd_dcache.h"
 #include "../../disco/diag/fd_diag_tile.h"
 #include "../../util/pod/fd_pod_format.h"
@@ -340,6 +341,7 @@ fd_topo_initialize( config_t * config ) {
     quic_tile_cnt   = 0UL;
     verify_tile_cnt = 0UL;
     config->tiles.bundle.enabled = 0;
+    config->tiles.gravity.enabled = 0;
   }
   fd_topob_wksp( topo, "metric_in"    );
   if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "diag_gui" );
@@ -929,15 +931,11 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "bundle_verif" );
     fd_topob_wksp( topo, "bundle_sign"  );
     fd_topob_wksp( topo, "sign_bundle"  );
-    fd_topob_wksp( topo, "pack_sign"    );
-    fd_topob_wksp( topo, "sign_pack"    );
     fd_topob_wksp( topo, "bundle"       );
 
     /**/                 fd_topob_link( topo, "bundle_verif", "bundle_verif", config->tiles.verify.receive_buffer_size, FD_TPU_PARSED_MTU,         1UL );
     /**/                 fd_topob_link( topo, "bundle_sign",  "bundle_sign",  65536UL,                                  9UL,                       1UL );
     /**/                 fd_topob_link( topo, "sign_bundle",  "sign_bundle",  128UL,                                    64UL,                      1UL );
-    /**/                 fd_topob_link( topo, "pack_sign",    "pack_sign",    65536UL,                                  1232UL,                    1UL );
-    /**/                 fd_topob_link( topo, "sign_pack",    "sign_pack",    128UL,                                    64UL,                      1UL );
 
     /**/                 fd_topob_tile( topo, "bundle",  "bundle",  "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 1, 0, 1 );
 
@@ -949,13 +947,6 @@ fd_topo_initialize( config_t * config ) {
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "sign_bundle",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_bundle",    0UL                                                );
 
-    if( leader_enabled ) {
-      /**/               fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "pack_sign",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
-      /**/               fd_topob_tile_out( topo, "pack",   0UL,                        "pack_sign",      0UL                                                );
-      /**/               fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
-      /**/               fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
-    }
-
     if( leader_enabled ) fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_slot",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
 
     if( config->tiles.gui.enabled ) { /* GUI is the only consumer of bundle_status */
@@ -966,6 +957,84 @@ fd_topo_initialize( config_t * config ) {
       fd_topob_link( topo, "bundle_status", "bundle_status", 128UL, sizeof(fd_bundle_block_engine_update_t), 1UL );
       fd_topob_tile_out( topo, "bundle", 0UL, "bundle_status", 0UL );
     }
+  }
+
+  if( config->tiles.gravity.enabled ) {
+    fd_topob_wksp( topo, "gbx"        );
+    fd_topob_wksp( topo, "gbx_resolv" );
+    fd_topob_wksp( topo, "resolv_gbx" );
+    fd_topob_wksp( topo, "gbx_pack"   );
+    fd_topob_wksp( topo, "pack_gbx"   );
+    fd_topob_wksp( topo, "gbx_gossip" );
+    fd_topob_wksp( topo, "gbx_shred"  );
+    fd_topob_wksp( topo, "gbx_sign"   );
+    fd_topob_wksp( topo, "sign_gbx"   );
+
+    /**/                 fd_topob_link( topo, "gbx_resolv", "gbx_resolv", 4096UL,  FD_TPU_PARSED_MTU,               5UL );
+    /**/                 fd_topob_link( topo, "resolv_gbx", "resolv_gbx", 4096UL,  sizeof(fd_gravity_resolv_fail_t), 1UL );
+    /**/                 fd_topob_link( topo, "gbx_pack",   "gbx_pack",   1024UL,  512UL,                           1UL );
+    /**/                 fd_topob_link( topo, "pack_gbx",   "pack_gbx",   16384UL, sizeof(fd_gravity_pack_report_t), 1UL );
+    /**/                 fd_topob_link( topo, "gbx_gossip", "gbx_gossip", 16UL,    sizeof(fd_gravity_tpu_t),         1UL );
+    /**/                 fd_topob_link( topo, "gbx_shred",  "gbx_shred",  16UL,    sizeof(fd_gravity_shred_dests_t), 1UL );
+    /**/                 fd_topob_link( topo, "gbx_sign",   "gbx_sign",   128UL,   72UL,                            1UL );
+    /**/                 fd_topob_link( topo, "sign_gbx",   "sign_gbx",   128UL,   64UL,                            1UL );
+
+    fd_topo_tile_t * gravity_tile = fd_topob_tile( topo, "gbx", "gbx", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 1, 0, 1 );
+
+    /* The relay-built window that pack reads, see fd_gravity.h */
+    fd_topo_obj_t * mode_obj = fd_topob_obj( topo, "fseq", "gbx" );
+    fd_topob_tile_uses( topo, gravity_tile, mode_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "pack", 0UL ) ], mode_obj, FD_SHMEM_JOIN_MODE_READ_ONLY );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, mode_obj->id, "gbx_mode" ) );
+
+    /* Whether the relay or the bundle tile subscribes to the block engine */
+    fd_topo_obj_t * relay_obj = fd_topob_obj( topo, "fseq", "gbx" );
+    fd_topob_tile_uses( topo, gravity_tile, relay_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    if( config->tiles.bundle.enabled ) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "bundle", 0UL ) ], relay_obj, FD_SHMEM_JOIN_MODE_READ_ONLY );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, relay_obj->id, "gbx_relay" ) );
+
+    /* The block engine's block builder, which relay nodes name for the tip crank */
+    if( config->tiles.bundle.enabled ) {
+      fd_topob_wksp( topo, "bundle_gbx" );
+      fd_topob_link( topo, "bundle_gbx", "bundle_gbx", 16UL, sizeof(fd_bundle_builder_info_t), 1UL );
+      fd_topob_tile_out( topo, "bundle", 0UL, "bundle_gbx", 0UL );
+      fd_topob_tile_in(  topo, "gbx", 0UL, "metric_in", "bundle_gbx", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    }
+
+    /**/                 fd_topob_tile_in(  topo, "gbx",    0UL,           "metric_in", "replay_slot",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    FOR(execle_tile_cnt) fd_topob_tile_in(  topo, "gbx",    0UL,           "metric_in", "execle_poh",     i,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "gbx",    0UL,                        "gbx_resolv",     0UL                                                );
+    FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv", i,             "metric_in", "gbx_resolv",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "resolv", 0UL,                        "resolv_gbx",     0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "gbx",    0UL,           "metric_in", "resolv_gbx",     0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "gbx",    0UL,                        "gbx_pack",       0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "gbx_pack",       0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "pack",   0UL,                        "pack_gbx",       0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "gbx",    0UL,           "metric_in", "pack_gbx",       0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "gbx",    0UL,                        "gbx_gossip",     0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "gossip", 0UL,           "metric_in", "gbx_gossip",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "gbx",    0UL,                        "gbx_shred",      0UL                                                );
+    FOR(shred_tile_cnt)  fd_topob_tile_in(  topo, "shred",  i,             "metric_in", "gbx_shred",      0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+
+    /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "gbx_sign",       0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "gbx",    0UL,                        "gbx_sign",       0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "gbx",    0UL,           "metric_in", "sign_gbx",       0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+    /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_gbx",       0UL                                                );
+  }
+
+  if( FD_UNLIKELY( config->tiles.bundle.enabled ) ) {
+    fd_topob_wksp( topo, "pack_sign" );
+    fd_topob_wksp( topo, "sign_pack" );
+
+    /**/                 fd_topob_link( topo, "pack_sign", "pack_sign", 65536UL, 1232UL, 1UL );
+    /**/                 fd_topob_link( topo, "sign_pack", "sign_pack", 128UL,   64UL,   1UL );
+
+    /* The tip crank.  sign_pack is pack's last input, because pack
+       indexes inputs as if all were polled. */
+    /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "pack_sign",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/                 fd_topob_tile_out( topo, "pack",   0UL,                        "pack_sign",      0UL                                                );
+    /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+    /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
   }
 
   /* Sign links don't need to be reliable because each requester has a
@@ -2098,6 +2167,31 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.out_depth = config->tiles.verify.receive_buffer_size;
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "gbx" ) ) ) {
+    fd_cstr_ncpy( tile->gravity.identity_key_path, config->paths.identity_key, sizeof(tile->gravity.identity_key_path) );
+    FD_TEST( fd_cstr_printf_check( tile->gravity.failsafe_path, sizeof(tile->gravity.failsafe_path), NULL, "%s/gravity_failsafe", config->paths.base ) );
+    tile->gravity.relay_cnt = config->tiles.gravity.relays_cnt;
+    for( ulong i=0UL; i<tile->gravity.relay_cnt; i++ ) {
+      char const * relay    = config->tiles.gravity.relays[ i ];
+      char const * colon    = strrchr( relay, ':' );
+      ulong        host_len = colon ? (ulong)( colon-relay ) : 0UL;
+      if( FD_UNLIKELY( !host_len || host_len>=sizeof(tile->gravity.relay_host[ i ]) ) )
+        FD_LOG_ERR(( "could not parse [tiles.gravity.relays] entry %s as host:port", relay ));
+      fd_memcpy( tile->gravity.relay_host[ i ], relay, host_len );
+      tile->gravity.relay_host[ i ][ host_len ] = '\0';
+      tile->gravity.relay_port[ i ] = fd_cstr_to_ushort( colon+1 );
+      if( FD_UNLIKELY( !tile->gravity.relay_port[ i ] ) )
+        FD_LOG_ERR(( "could not parse [tiles.gravity.relays] entry %s as host:port", relay ));
+    }
+    tile->gravity.jito_tip_weight_bps = (ushort)config->tiles.gravity.jito_tip_weight_bps;
+    tile->gravity.filter_ofac         = config->tiles.gravity.filter_ofac;
+    tile->gravity.blacklisted_cnt     = config->tiles.gravity.blacklisted_accounts_cnt;
+    for( ulong i=0UL; i<tile->gravity.blacklisted_cnt; i++ ) {
+      if( FD_UNLIKELY( !fd_base58_decode_32( config->tiles.gravity.blacklisted_accounts[ i ], tile->gravity.blacklisted[ i ] ) ) )
+        FD_LOG_ERR(( "could not parse account %s at index %lu in [tiles.gravity.blacklisted_accounts]", config->tiles.gravity.blacklisted_accounts[ i ], i ));
+    }
+    tile->gravity.execle_cnt          = config->firedancer.layout.execle_tile_count;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "solcap" ) ) ) {
 

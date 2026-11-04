@@ -1,0 +1,105 @@
+# logfile_fd: It can be disabled by configuration, but typically tiles
+#             will open a log file on boot and write all messages there.
+#
+# failsafe_fd: The failsafe file, which holds whether the failsafe is
+#              set across restarts.
+#
+# etc_hosts_fd, etc_resolv_conf: Used to resolve relay hostnames.
+#
+# epoll_inner_fd: Kernel file descriptors are waited by a separate tile
+#                 (the waker) for scheduling reasons, so the relay TCP
+#                 sockets and the DNS socket are added to this epoll set.
+#
+# epoll_outer_fd: The waker puts our inner set into another set.  This
+#                 tile rearms its inner set there after a drain.
+uint logfile_fd, uint failsafe_fd, uint etc_hosts_fd, uint etc_resolv_conf, uint epoll_inner_fd, uint epoll_outer_fd
+
+# logging: all log messages are written to a file and/or pipe
+#
+# 'WARNING' and above are written to the STDERR pipe, while all
+# messages are always written to the log file.
+#
+# arg 0 is the file descriptor to write to.  The boot process ensures
+# that descriptor 2 is always STDERR.
+write: (or (eq (arg 0) 2)
+           (eq (arg 0) logfile_fd))
+
+# logging: 'WARNING' and above fsync the logfile to disk immediately
+#
+# arg 0 is the file descriptor to fsync.
+fsync: (or (eq (arg 0) logfile_fd)
+           (eq (arg 0) failsafe_fd))
+
+# gravity: set or clear the failsafe
+pwrite64: (eq (arg 0) failsafe_fd)
+
+# gravity: TCP connection to the relay
+#
+# dns: the UDP socket of the non-blocking DNS client, opened once
+socket: (and (eq (arg 0) "AF_INET")
+             (or (eq (arg 1) "SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK")
+                 (eq (arg 1) "SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK"))
+             (eq (arg 2) 0))
+
+# gravity: connect to the relay, and check if a connect finished
+connect
+
+# gravity: close the relay connection on an error, before reconnecting
+close
+
+# gravity: configure the relay TCP socket
+setsockopt: (and (eq (arg 1) SOL_TCP)
+                 (or (eq (arg 2) TCP_NODELAY)
+                     (eq (arg 2) TCP_USER_TIMEOUT)))
+
+# gravity: read from the relay connection
+recvfrom: (eq (arg 3) "MSG_DONTWAIT")
+
+# dns: receive answers
+recvmsg: (eq (arg 2) 0)
+
+# gravity: write to the relay connection
+#
+# dns: send queries
+sendto: (or (eq (arg 3) "MSG_NOSIGNAL|MSG_DONTWAIT")
+            (eq (arg 3) "MSG_NOSIGNAL"))
+
+# dns: read /etc/hosts and /etc/resolv.conf
+read: (or (eq (arg 0) etc_hosts_fd)
+          (eq (arg 0) etc_resolv_conf))
+
+# dns: rewind /etc/hosts and /etc/resolv.conf
+lseek: (and (or (eq (arg 0) etc_resolv_conf)
+                (eq (arg 0) etc_hosts_fd))
+            (eq (arg 1) 0)
+            (eq (arg 2) "SEEK_SET"))
+
+# waker: register the TCP socket in the tile's inner epoll set on
+# (re)connect, and rearm the tile's entry in the waker's outer epoll
+# set after servicing
+#
+# arg 0 is the epoll fd being modified.  The tile may modify its own
+# inner set freely, and may only touch its own inner fd's entry in the
+# outer set.
+epoll_ctl: (or (eq (arg 0) epoll_inner_fd)
+               (and (eq (arg 0) epoll_outer_fd)
+                    (eq (arg 2) epoll_inner_fd)))
+
+# power saving: sleep when there is no work to do
+#
+# In the efficient scheduler mode, an idle tile parks on its sleep word
+# with futex_wait until a producer has work for it or its next deadline
+# passes.
+#
+# arg 1 is the futex op, always FUTEX_WAIT_BITSET so the timeout is an
+# absolute deadline.  arg 2 is the expected value of the word, always 0
+# (parked).
+futex: (and (eq (arg 1) FUTEX_WAIT_BITSET)
+            (eq (arg 2) 0))
+
+# power saving: resume an interrupted sleep
+#
+# A signal delivered to a parked tile interrupts its futex_wait, and the
+# kernel resumes the wait with the remaining timeout via restart_syscall
+# when the tile next runs.
+restart_syscall

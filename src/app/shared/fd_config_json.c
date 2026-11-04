@@ -12,7 +12,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==26563824UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==26565600UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -126,6 +126,7 @@ static char const * const jw_redacted_keys[] = {
   "net.bind_address",
   "tiles.quic.ssl_key_log_file",
   "tiles.bundle.url",
+  "tiles.gravity.relays",
   "tiles.event.url",
   "tiles.shred.additional_shred_destinations_retransmit",
   "tiles.shred.additional_shred_destinations_leader",
@@ -174,6 +175,7 @@ static char const * const jw_reported_keys[] = {
   "tiles.bundle.tip_distribution_authority",
   "tiles.pack.schedule_strategy",
   "tiles.pack.account_blocklist",
+  "tiles.gravity.blacklisted_accounts",
   "tiles.replay.enable_features",
   "development.core_dump",
   "development.bench.affinity",
@@ -206,6 +208,8 @@ static char const * const jw_array_keys[] = {
   "snapshots.sources.servers",
   "tiles.pack.account_blocklist",
   "tiles.replay.enable_features",
+  "tiles.gravity.relays",
+  "tiles.gravity.blacklisted_accounts",
   "tiles.shred.additional_shred_destinations_retransmit",
   "tiles.shred.additional_shred_destinations_leader",
 };
@@ -575,6 +579,13 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "commission_bps",                config->tiles.bundle.commission_bps );
       jw_ulong( &w, "keepalive_interval_millis",     config->tiles.bundle.keepalive_interval_millis );
       jw_bool ( &w, "tls_cert_verify",               config->tiles.bundle.tls_cert_verify );
+    jw_obj_close( &w );
+    jw_obj_open( &w, "gravity" );
+      jw_bool    ( &w, "enabled",                  config->tiles.gravity.enabled );
+      jw_path_arr( &w, "relays",                   config->tiles.gravity.relays_cnt );
+      jw_ulong   ( &w, "jito_tip_weight_bps",      config->tiles.gravity.jito_tip_weight_bps );
+      jw_bool    ( &w, "filter_ofac",              config->tiles.gravity.filter_ofac );
+      jw_str_arr ( &w, "blacklisted_accounts",     config->tiles.gravity.blacklisted_accounts[ 0 ], sizeof(config->tiles.gravity.blacklisted_accounts[ 0 ]), config->tiles.gravity.blacklisted_accounts_cnt );
     jw_obj_close( &w );
     jw_obj_open( &w, "pack" );
       jw_ulong( &w, "max_pending_transactions", config->tiles.pack.max_pending_transactions );
