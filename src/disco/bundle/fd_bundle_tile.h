@@ -27,6 +27,15 @@ struct fd_bundle_block_engine_update {
 };
 typedef struct fd_bundle_block_engine_update fd_bundle_block_engine_update_t;
 
+/* bundle_gravity: the block builder of the block engine's fee info,
+   which the gravity tile names on relay nodes for the tip crank. */
+
+struct fd_bundle_builder_info {
+  uchar pubkey[ 32 ];
+  ulong commission; /* percent */
+};
+typedef struct fd_bundle_builder_info fd_bundle_builder_info_t;
+
 FD_PROTOTYPES_BEGIN
 
 extern fd_topo_run_tile_t fd_tile_bundle;

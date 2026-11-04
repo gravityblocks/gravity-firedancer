@@ -11,6 +11,7 @@
 #include "../../flamenco/stakes/fd_stake_weight_sort.h"
 #include "../../disco/topo/fd_dns_resolve.h"
 #include "../../disco/fd_txn_m.h"
+#include "../gravity/fd_gravity.h"
 #include "../restore/utils/fd_ssmsg.h"
 #include "../restore/utils/fd_wfs.h"
 
@@ -19,6 +20,7 @@
 #define IN_KIND_SIGN          (2)
 #define IN_KIND_EPOCH         (4)
 #define IN_KIND_SNAPIN_MANIF  (6)
+#define IN_KIND_GRAVITY       (7)
 
 FD_FN_CONST static inline ulong
 scratch_align( void ) {
@@ -336,6 +338,22 @@ handle_shred_version( fd_gossip_tile_ctx_t * ctx,
   fd_gossip_set_shred_version( ctx->gossip, (ushort)sig );
 }
 
+/* gravity_tpu points our TPU sockets at the relay's address, or
+   restores the ones from config. */
+
+static void
+gravity_tpu( fd_gossip_tile_ctx_t *   ctx,
+             fd_gravity_tpu_t const * tpu ) {
+  static ulong const tags[ 4 ] = { FD_GOSSIP_CONTACT_INFO_SOCKET_TPU,      FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS,
+                                   FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC, FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC };
+  for( ulong i=0UL; i<4UL; i++ ) {
+    fd_gossip_socket_t socket = ctx->local_tpu[ i ];
+    if( FD_LIKELY( tpu->ip4 ) ) socket = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = tpu->ip4, .port = fd_ushort_bswap( (ushort)( tpu->port + fd_uint_if( i>=2UL, 6U, 0U ) ) ) };
+    ctx->my_contact_info->sockets[ tags[ i ] ] = socket;
+    fd_gossip_set_socket( ctx->gossip, tags[ i ], socket );
+  }
+}
+
 static void
 handle_epoch( fd_gossip_tile_ctx_t *      ctx,
               fd_epoch_info_msg_t const * msg ) {
@@ -488,6 +506,7 @@ returnable_frag( fd_gossip_tile_ctx_t * ctx,
   switch( ctx->in[ in_idx ].kind ) {
     case IN_KIND_SHRED_VERSION: handle_shred_version( ctx, sig ); break;
     case IN_KIND_EPOCH:         handle_epoch( ctx, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ) ); break;
+    case IN_KIND_GRAVITY:        gravity_tpu( ctx, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ) ); break;
     case IN_KIND_SNAPIN_MANIF: {
       if( FD_LIKELY( ctx->wfs_state==FD_GOSSIP_WFS_STATE_DONE ) ) break;
 
@@ -629,6 +648,9 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->in[ i ].kind = IN_KIND_EPOCH;
     } else if( FD_UNLIKELY( !strcmp( link->name, "snapin_manif" ) ) ) {
       ctx->in[ i ].kind = IN_KIND_SNAPIN_MANIF;
+    } else if( FD_UNLIKELY( !strcmp( link->name, "gbx_gossip" ) ) ) {
+      ctx->in[ i ].kind = IN_KIND_GRAVITY;
+      FD_TEST( link->mtu==sizeof(fd_gravity_tpu_t) );
     } else {
       FD_LOG_ERR(( "unexpected input link name %s", link->name ));
     }
@@ -688,6 +710,11 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TVU_QUIC ]          = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_RPC ]               = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_RPC_PUBSUB ]        = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
+
+  ctx->local_tpu[ 0 ] = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU               ];
+  ctx->local_tpu[ 1 ] = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS      ];
+  ctx->local_tpu[ 2 ] = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC          ];
+  ctx->local_tpu[ 3 ] = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC ];
 
   ctx->gossip = fd_gossip_join( fd_gossip_new( _gossip,
                                                ctx->rng,

@@ -144,6 +144,15 @@ void
 fd_gossip_set_shred_version( fd_gossip_t * gossip,
                              ushort        shred_version );
 
+/* fd_gossip_set_socket sets the socket with the given
+   FD_GOSSIP_CONTACT_INFO_SOCKET_* tag in our contact info, which is
+   republished on the next advance. */
+
+void
+fd_gossip_set_socket( fd_gossip_t *      gossip,
+                      ulong              tag,
+                      fd_gossip_socket_t socket );
+
 void
 fd_gossip_stakes_update( fd_gossip_t *             gossip,
                          fd_stake_weight_t const * stake_weights,
