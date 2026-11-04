@@ -1727,6 +1727,9 @@ deliberate exception with lint-allow="<rule id>")
 <tile name="admin">
 </tile>
 
+<tile name="gbx">
+</tile>
+
 <tile name="waker">
     <counter name="EpollWaitReturned" summary="epoll_pwait calls on the outer epoll set that returned, including timeouts; EINTR not counted" />
     <counter name="WakeDelivered" summary="Client wakes delivered (readiness fseq raised)" />

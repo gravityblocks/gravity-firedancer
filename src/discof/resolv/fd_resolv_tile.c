@@ -1,5 +1,6 @@
 #include "fd_resolv_tile.h"
 #include "../../disco/fd_txn_m.h"
+#include "../gravity/fd_gravity.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../replay/fd_replay_tile.h"
 #include "../../discof/fd_startup.h"
@@ -22,8 +23,9 @@
 #include "../../util/simd/fd_avx.h"
 #endif
 
-#define IN_KIND_DEDUP  (0)
-#define IN_KIND_REPLAY (1)
+#define IN_KIND_DEDUP   (0)
+#define IN_KIND_REPLAY  (1)
+#define IN_KIND_GRAVITY (2)
 
 struct blockhash {
   uchar b[ 32 ];
@@ -142,6 +144,8 @@ typedef struct {
 
   int   bundle_failed;
   ulong bundle_id;
+  ulong bundle_left;    /* transactions of bundle_id not seen yet */
+  ulong bundle_drop_id; /* a block engine bundle overlapped by a relay node */
 
   map_t * blockhash_map;
   map_t * nonce_blockhash_map;
@@ -193,6 +197,8 @@ typedef struct {
 
   fd_resolv_out_ctx_t out_pack[ 1UL ];
   fd_resolv_out_ctx_t out_replay[ 1UL ];
+  fd_resolv_out_ctx_t out_gravity[ 1UL ];
+  ulong               out_gravity_idx;
 
   /* Scratch buffers for fd_accdb_read_one_nocache.  RO accdb joiners
      must use the nocache API (see fd_accdb.h), which writes the account
@@ -262,7 +268,8 @@ during_frag( fd_resolv_ctx_t * ctx,
     FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
 
   switch( ctx->in[in_idx].kind ) {
-    case IN_KIND_DEDUP: {
+    case IN_KIND_DEDUP:
+    case IN_KIND_GRAVITY: {
       uchar * src = (uchar *)fd_chunk_to_laddr( ctx->in[in_idx].mem, chunk );
       uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->out_pack->mem, ctx->out_pack->chunk );
       fd_memcpy( dst, src, sz );
@@ -401,6 +408,26 @@ after_credit( fd_resolv_ctx_t *   ctx,
   ctx->flush_pool_idx = next;
 }
 
+/* bundle_fail fails the current bundle.  The gravity tile hears about
+   each of its nodes that fails here. */
+
+static inline void
+bundle_fail( fd_resolv_ctx_t *   ctx,
+             ulong               in_idx,
+             fd_txn_m_t const *  txnm,
+             int                 err,
+             fd_stem_context_t * stem ) {
+  ctx->bundle_failed = 1;
+  if( FD_LIKELY( ctx->in[ in_idx ].kind!=IN_KIND_GRAVITY ) ) return;
+
+  fd_gravity_resolv_fail_t * fail = fd_chunk_to_laddr( ctx->out_gravity->mem, ctx->out_gravity->chunk );
+  fail->bundle_id = txnm->block_engine.bundle_id;
+  fail->err       = err;
+  fd_memcpy( fail->signature, fd_txn_m_payload_const( txnm )+fd_txn_m_txn_t_const( txnm )->signature_off, 64UL );
+  fd_stem_publish( stem, ctx->out_gravity_idx, 0UL, ctx->out_gravity->chunk, sizeof(fd_gravity_resolv_fail_t), 0UL, 0UL, 0UL );
+  ctx->out_gravity->chunk = fd_dcache_compact_next( ctx->out_gravity->chunk, sizeof(fd_gravity_resolv_fail_t), ctx->out_gravity->chunk0, ctx->out_gravity->wmark );
+}
+
 static inline void
 after_frag( fd_resolv_ctx_t *   ctx,
             ulong               in_idx,
@@ -513,12 +540,32 @@ after_frag( fd_resolv_ctx_t *   ctx,
     buffer.  If we later see the blockhash come to exist, we forward any
     buffered transactions to back. */
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
-    ctx->bundle_failed = 0;
-    ctx->bundle_id     = txnm->block_engine.bundle_id;
+  /* Relay nodes and block engine bundles reach resolv:0 on different
+     links, but pack takes one bundle at a time.  If they overlap, the
+     block engine bundle is dropped. */
+  ulong bundle_id = txnm->block_engine.bundle_id;
+  if( FD_UNLIKELY( bundle_id ) ) {
+    int is_relay = !!(bundle_id & FD_GRAVITY_ID_BIT);
+    if( FD_UNLIKELY( bundle_id==ctx->bundle_drop_id ) ) {
+      ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BUNDLE_PEER_FAILED_IDX ]++;
+      return;
+    }
+    if( FD_UNLIKELY( bundle_id!=ctx->bundle_id && ctx->bundle_left && is_relay!=!!(ctx->bundle_id & FD_GRAVITY_ID_BIT) ) ) {
+      ctx->bundle_drop_id = is_relay ? ctx->bundle_id : bundle_id;
+      if( !is_relay ) {
+        ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BUNDLE_PEER_FAILED_IDX ]++;
+        return;
+      }
+    }
+    if( FD_UNLIKELY( bundle_id!=ctx->bundle_id ) ) {
+      ctx->bundle_failed = 0;
+      ctx->bundle_id     = bundle_id;
+      ctx->bundle_left   = txnm->block_engine.bundle_txn_cnt;
+    }
+    ctx->bundle_left = fd_ulong_sat_sub( ctx->bundle_left, 1UL );
   }
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && ctx->bundle_failed ) ) {
+  if( FD_UNLIKELY( bundle_id && ctx->bundle_failed ) ) {
     ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BUNDLE_PEER_FAILED_IDX ]++;
     return;
   }
@@ -535,7 +582,7 @@ after_frag( fd_resolv_ctx_t *   ctx,
   if( FD_LIKELY( blockhash ) ) {
     txnm->reference_block_height = blockhash->block_height;
     if( FD_UNLIKELY( (!is_durable_nonce) & (txnm->reference_block_height+151UL<ctx->completed_block_height) ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) bundle_fail( ctx, in_idx, txnm, FD_RUNTIME_TXN_ERR_BLOCKHASH_NOT_FOUND, stem );
       ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BLOCKHASH_EXPIRED_IDX ]++;
       return;
     }
@@ -576,13 +623,13 @@ after_frag( fd_resolv_ctx_t *   ctx,
   if( FD_UNLIKELY( txnt->addr_table_adtl_cnt ) ) {
     if( FD_UNLIKELY( !ctx->bank ) ) {
       ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_NO_BANK_IDX ]++;
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) bundle_fail( ctx, in_idx, txnm, FD_GRAVITY_ERR_NO_BANK, stem );
       return;
     }
 
     int result = peek_aluts( ctx, txnm );
     if( FD_UNLIKELY( result ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) bundle_fail( ctx, in_idx, txnm, result, stem );
       return;
     }
   }
@@ -614,8 +661,10 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->round_robin_cnt = fd_topo_tile_name_cnt( topo, tile->name );
   ctx->round_robin_idx = tile->kind_id;
 
-  ctx->bundle_failed = 0;
-  ctx->bundle_id     = 0UL;
+  ctx->bundle_failed  = 0;
+  ctx->bundle_id      = 0UL;
+  ctx->bundle_left    = 0UL;
+  ctx->bundle_drop_id = 0UL;
 
   ctx->completed_slot         = 0UL;
   ctx->completed_block_height = 0UL;
@@ -649,6 +698,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
     if( FD_LIKELY(      !strcmp( link->name, "replay_slot"  ) ) ) ctx->in[ i ].kind = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "dedup_resolv" ) ) ) ctx->in[ i ].kind = IN_KIND_DEDUP;
+    else if( FD_LIKELY( !strcmp( link->name, "gbx_resolv"   ) ) ) ctx->in[ i ].kind = IN_KIND_GRAVITY;
     else FD_LOG_ERR(( "unknown in link name '%s'", link->name ));
 
     ctx->in[i].mem    = link_wksp->wksp;
@@ -666,6 +716,15 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->out_replay->chunk0 = fd_dcache_compact_chunk0( ctx->out_replay->mem, topo->links[ tile->out_link_id[ 1 ] ].dcache );
   ctx->out_replay->wmark  = fd_dcache_compact_wmark ( ctx->out_replay->mem, topo->links[ tile->out_link_id[ 1 ] ].dcache, topo->links[ tile->out_link_id[ 1 ] ].mtu );
   ctx->out_replay->chunk  = ctx->out_replay->chunk0;
+
+  ctx->out_gravity_idx = fd_topo_find_tile_out_link( topo, tile, "resolv_gbx", 0UL );
+  if( FD_UNLIKELY( ctx->out_gravity_idx!=ULONG_MAX ) ) {
+    fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ ctx->out_gravity_idx ] ];
+    ctx->out_gravity->mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->out_gravity->chunk0 = fd_dcache_compact_chunk0( ctx->out_gravity->mem, link->dcache );
+    ctx->out_gravity->wmark  = fd_dcache_compact_wmark ( ctx->out_gravity->mem, link->dcache, link->mtu );
+    ctx->out_gravity->chunk  = ctx->out_gravity->chunk0;
+  }
 
   ulong banks_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "banks" );
   FD_TEST( banks_obj_id!=ULONG_MAX );

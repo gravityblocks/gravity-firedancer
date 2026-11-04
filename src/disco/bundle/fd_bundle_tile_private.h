@@ -151,6 +151,7 @@ struct fd_bundle_tile {
   uchar builder_commission;  /* in [0,100] (percent) */
   uchar builder_info_avail : 1;  /* Block builder info available? (potentially stale) */
   uchar builder_info_wait  : 1;  /* Request already in-flight? */
+  uchar builder_info_new   : 1;  /* Not yet published to the gravity tile */
   long  builder_info_valid_until;
 
   /* Bundle subscriptions */
@@ -173,6 +174,7 @@ struct fd_bundle_tile {
   fd_stem_context_t *       stem;
   fd_bundle_out_ctx_t       verify_out;
   fd_bundle_out_ctx_t       plugin_out;
+  fd_bundle_out_ctx_t       gravity_out;
   fd_bundle_pending_txn_t * pending_txns;
 
   /* App metrics */
@@ -188,6 +190,12 @@ struct fd_bundle_tile {
   ulong reset_slot;       /* from replay_out reset messages, or ULONG_MAX */
   int   sleep_mode;       /* 1 means sleeping, 0 means connecting/connected */
   long  sleep_check_ns;   /* next wallclock time to re-evaluate sleeping */
+
+  /* A block building relay takes the block engine subscriptions while
+     the gravity tile holds a relay session.  The tile stays connected
+     for the block builder fee info.  NULL without gravity. */
+  ulong const * gravity_relay;
+  int           relay_up;
 
   fd_clock_tile_t clock[1]; /* fast wallclock-ns source for fd_bundle_now */
   int   halt_signing;     /* 1 means signing is halted, 0 means signing is not halted */

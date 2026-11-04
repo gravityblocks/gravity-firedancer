@@ -334,6 +334,19 @@ struct fd_topo_tile {
     } bundle;
 
     struct {
+      char   identity_key_path[ PATH_MAX ];
+      char   failsafe_path[ PATH_MAX ];
+      ulong  relay_cnt;
+      char   relay_host[ 4 ][ 256 ];
+      ushort relay_port[ 4 ];
+      ushort jito_tip_weight_bps;
+      int    filter_ofac;
+      ulong  blacklisted_cnt;
+      uchar  blacklisted[ 16 ][ 32 ];
+      ulong  execle_cnt;
+    } gravity;
+
+    struct {
       char   url[ FD_URL_MAX ];
       char   identity_key_path[ PATH_MAX ];
       char   action[ 16 ];
