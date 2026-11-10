@@ -10,6 +10,7 @@
 #include "../../disco/keyguard/fd_keyguard_client.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
 #include "../../disco/waker/fd_waker.h"
+#include "../../disco/wait_info/fd_wait_info.h"
 #include "../../disco/bundle/fd_bundle_tile.h"
 #include "../../waltz/resolv/fd_netdb.h"
 #include "../../waltz/resolv/fd_adns.h"
@@ -34,6 +35,10 @@
    walks each graph in dependency order telling pack which node to run
    next, and reports each node that is not included.  fd_gravity.h
    describes the messages it exchanges with resolv, pack and gossip. */
+
+/* The version the relay sees follows gravity-connector releases, not
+   Firedancer's, which gossip reports. */
+#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.1"
 
 #define IN_KIND_REPLAY (0)
 #define IN_KIND_EXECLE (1)
@@ -235,6 +240,9 @@ typedef struct {
   ulong   active;        /* ULONG_MAX if no relay is logged in */
   ulong   lost;          /* the relay last active, ULONG_MAX if none */
   int     halted;        /* identity switch in progress */
+  int     asleep;        /* off the relays, see update_sleep */
+  int     caught_up;
+  fd_wait_info_box_t const * wait_info;
   fd_netdb_fds_t netdb_fds[1];
   fd_adns_t *    adns;
   long    next_rx_poll;  /* ticks */
@@ -317,6 +325,7 @@ typedef struct {
   out_ctx_t shred_out [1];
 
   union {
+    fd_replay_slot_completed_t completed;
     fd_poh_reset_t           reset;
     fd_became_leader_t       became_leader;
     fd_gravity_pack_report_t report;
@@ -449,9 +458,8 @@ send_result( fd_gravity_tile_t * ctx,
              ulong               rx_at,
              node_t const *      node ) {
   if( FD_UNLIKELY( !has_session( ctx ) ) ) return;
-  int included = 1;
-  for( ulong i=0UL; i<fd_uint_max( node->txn_cnt, 1U ); i++ ) included &= !node->ni[ i ];
-  if( FD_LIKELY( included ) ) return; /* the relay only needs failures */
+  /* TODO: the relay probably only needs failures.  Results for included
+     nodes are only telemetry, so skip them to save network work. */
   ctx->stat[ STAT_RESULTS ]++;
   fd_gravity_wire_result_t result = {
     .slot        = slot,
@@ -1118,13 +1126,31 @@ on_reset( fd_gravity_tile_t *    ctx,
   if( FD_LIKELY( slot!=reset->next_leader_slot || !ctx->mode_val ) ) set_progress_slot( ctx, slot );
 }
 
+/* on_slot_completed reports Progress for every slot replay completes,
+   and ends our leadership once its window completes.  Under Alpenglow,
+   replay resets only ahead of our leader windows. */
+
+static void
+on_slot_completed( fd_gravity_tile_t *                ctx,
+                   fd_replay_slot_completed_t const * completed ) {
+  if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX && completed->slot>=window_end( ctx->leader_slot ) ) ) {
+    end_slot( ctx, ctx->next_leader_slot==ctx->leader_slot+1UL );
+  }
+  ulong slot = completed->slot+1UL;
+  if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX || ( ctx->progress_slot!=ULONG_MAX && slot<=ctx->progress_slot ) ) ) return;
+  ctx->blockhash_known = 1;
+  fd_memcpy( ctx->blockhash, completed->block_hash.uc, 32UL );
+  if( FD_LIKELY( slot!=ctx->next_leader_slot || !ctx->mode_val ) ) set_progress_slot( ctx, slot );
+}
+
 static void
 on_became_leader( fd_gravity_tile_t *        ctx,
                   fd_became_leader_t const * became ) {
   ulong slot = became->slot;
   if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX && slot!=ctx->leader_slot ) ) end_slot( ctx, slot==ctx->leader_slot+1UL );
-  ctx->leader_slot     = slot;
-  ctx->leader_start_ns = became->slot_start_ns;
+  ctx->leader_slot      = slot;
+  ctx->next_leader_slot = slot;
+  ctx->leader_start_ns  = became->slot_start_ns;
   ctx->leader_end_ns   = became->slot_end_ns;
   ctx->slot_relay      = 0;
   ctx->slot_executed   = 0;
@@ -1282,7 +1308,7 @@ dns_advance( fd_gravity_tile_t * ctx ) {
     relay_t * r = ctx->relay+res->req_id;
     r->resolving = 0;
     if( FD_UNLIKELY( res->err ) ) FD_LOG_WARNING(( "resolving relay `%s` failed (%d-%s)", r->host, res->err, fd_gai_strerror( res->err ) ));
-    if( FD_UNLIKELY( res->err || ctx->halted ) ) {
+    if( FD_UNLIKELY( res->err || ctx->halted || ctx->asleep ) ) {
       r->reconnect_at = deadline_ns( ctx, RECONNECT_NS );
       continue;
     }
@@ -1617,6 +1643,32 @@ on_resolv_fail( fd_gravity_tile_t *              ctx,
   admit_failed( ctx, graph, idx, reason );
 }
 
+/* update_sleep keeps the tile off the relays until replay has caught up
+   and our identity has leader slots, as the bundle tile keeps off the
+   block engine.  Until then the relay can't build for us, and rejects
+   an unstaked identity.  It also tracks the next leader slot, which
+   Alpenglow replay publishes in a reset only right before our windows. */
+
+static void
+update_sleep( fd_gravity_tile_t * ctx ) {
+  fd_wait_info_t wi[1];
+  if( FD_UNLIKELY( !fd_wait_info_try_read( wi, ctx->wait_info ) ) ) return;
+  ctx->caught_up |= wi->caught_up;
+  ulong next = ( wi->next_leader_known && wi->next_leader_slot ) ? wi->next_leader_slot : ULONG_MAX;
+  /* Replay writes wait_info in housekeeping, so a read can predate the
+     leader slot we were just told we lead */
+  if( ctx->leader_slot==ULONG_MAX || next>=ctx->leader_slot ) ctx->next_leader_slot = next;
+  int asleep = !ctx->caught_up || !wi->next_leader_known || !wi->next_leader_slot;
+  if( FD_LIKELY( asleep==ctx->asleep ) ) return;
+  ctx->asleep = asleep;
+  if( asleep ) {
+    for( ulong i=0UL; i<ctx->relay_cnt; i++ ) ctx->relay[ i ].drop = 1;
+    FD_LOG_NOTICE(( "gravity tile sleeping: %s", ctx->caught_up ? "no upcoming leader slots" : "not caught up" ));
+  } else {
+    FD_LOG_NOTICE(( "gravity tile waking: next leader slot %lu", wi->next_leader_slot ));
+  }
+}
+
 /* Stem callbacks *****************************************************/
 
 static void
@@ -1632,13 +1684,14 @@ during_housekeeping( fd_gravity_tile_t * ctx ) {
     ctx->halted = 0;
     fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
   }
+  update_sleep( ctx );
   drop_if_requested( ctx );
 
   long now = fd_tickcount();
   for( ulong i=0UL; i<ctx->relay_cnt; i++ ) {
     relay_t * r = ctx->relay+i;
     if( FD_UNLIKELY( r->state==STATE_DISCONNECTED ) ) {
-      if( !ctx->halted && !r->resolving && now>=r->reconnect_at ) r->resolving = !fd_adns_resolve( ctx->adns, r->host, i );
+      if( !ctx->halted && !ctx->asleep && !r->resolving && now>=r->reconnect_at ) r->resolving = !fd_adns_resolve( ctx->adns, r->host, i );
     } else if( FD_UNLIKELY( r->state!=STATE_READY && now>r->deadline ) ) {
       FD_LOG_WARNING(( "relay %s %s timed out", r->host, r->state==STATE_CONNECTING ? "connect" : "login" ));
       r->drop = 1;
@@ -1646,11 +1699,14 @@ during_housekeeping( fd_gravity_tile_t * ctx ) {
   }
   dns_advance( ctx );
   if( FD_LIKELY( has_session( ctx ) && !ctx->relay[ ctx->active ].rx_held ) ) {
-    /* The relay pings every few ms near our leader slots.  The socket
-       is not read while a graph frame is retained. */
+    /* The relay pings every few ms near our leader slots, and slows down
+       once our last slot ends, which can be well before replay completes
+       it.  The socket is not read while a graph frame is retained. */
     relay_t * r    = ctx->relay+ctx->active;
     ulong     next = ctx->next_leader_slot;
-    int       near = ctx->leader_slot!=ULONG_MAX || ( next!=ULONG_MAX && ctx->progress_slot!=ULONG_MAX && next<=ctx->progress_slot+NEAR_LEADER_SLOTS );
+    ulong     prog = ctx->progress_slot;
+    int       near = ( ctx->leader_slot!=ULONG_MAX && fd_log_wallclock()<ctx->leader_end_ns ) ||
+                     ( next!=ULONG_MAX && prog!=ULONG_MAX && next>prog && next<=prog+NEAR_LEADER_SLOTS );
     long      silence = near && !ctx->tripped ? LEADER_SILENCE_NS : IDLE_SILENCE_NS;
     if( FD_UNLIKELY( now-r->last_rx>(long)( (double)silence*ctx->tick_per_ns ) ) ) {
       FD_LOG_WARNING(( "relay %s went silent", r->host ));
@@ -1777,7 +1833,7 @@ before_frag( fd_gravity_tile_t * ctx,
              ulong               seq,
              ulong               sig ) {
   (void)seq;
-  if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY ) return sig!=REPLAY_SIG_RESET && sig!=REPLAY_SIG_BECAME_LEADER;
+  if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY ) return sig!=REPLAY_SIG_SLOT_COMPLETED && sig!=REPLAY_SIG_RESET && sig!=REPLAY_SIG_BECAME_LEADER;
   if( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE ) return !ctx->slot_relay && !ctx->drain_cnt;
   return 0;
 }
@@ -1809,7 +1865,8 @@ after_frag( fd_gravity_tile_t * ctx,
   (void)seq; (void)tsorig; (void)tspub; (void)stem;
   switch( ctx->in_kind[ in_idx ] ) {
   case IN_KIND_REPLAY:
-    if(      sig==REPLAY_SIG_RESET         && sz==sizeof(fd_poh_reset_t)          ) on_reset        ( ctx, &ctx->staged.reset         );
+    if(      sig==REPLAY_SIG_SLOT_COMPLETED && sz==sizeof(fd_replay_slot_completed_t) ) on_slot_completed( ctx, &ctx->staged.completed );
+    else if( sig==REPLAY_SIG_RESET         && sz==sizeof(fd_poh_reset_t)          ) on_reset        ( ctx, &ctx->staged.reset         );
     else if( sig==REPLAY_SIG_BECAME_LEADER && sz==sizeof(fd_became_leader_t)      ) on_became_leader( ctx, &ctx->staged.became_leader );
     break;
   case IN_KIND_EXECLE:
@@ -1916,7 +1973,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lost          = ULONG_MAX;
   ctx->shred_applied = ULONG_MAX;
   /* As the connector reports its build: v{version}+{sha8}[.dirty] ({branch}/{sha}[-dirty]) */
-  fd_cstr_printf( ctx->version, sizeof(ctx->version), NULL, "v%s+%.8s%s (%s/%s%s)", fd_version_cstr,
+  fd_cstr_printf( ctx->version, sizeof(ctx->version), NULL, "v%s+%.8s%s (%s/%s%s)", FD_GRAVITY_CONNECTOR_VERSION,
                   fd_commit_ref_cstr, FD_GRAVITY_DIRTY ? ".dirty" : "", FD_GRAVITY_BRANCH_CSTR,
                   fd_commit_ref_cstr, FD_GRAVITY_DIRTY ? "-dirty" : "" );
   ctx->execle_cnt          = tile->gravity.execle_cnt;
@@ -1951,6 +2008,13 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   FD_TEST( ctx->keyswitch );
+
+  ulong wait_info_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "wait_info" );
+  FD_TEST( wait_info_obj_id!=ULONG_MAX );
+  ctx->wait_info = fd_wait_info_box_join( fd_topo_obj_laddr( topo, wait_info_obj_id ) );
+  FD_TEST( ctx->wait_info );
+  ctx->asleep    = 1;
+  ctx->caught_up = 0;
 
   ulong polled = 0UL;
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
