@@ -1646,6 +1646,41 @@ telemetry = true
         # this option to 'false'.
         tls_cert_verify = true
 
+    # The gravity tile builds our leader blocks from a Gravity block
+    # building relay.  During relay-built leader windows, pack runs only
+    # the relay's orders, in the order the relay's graphs give, and the
+    # validator advertises the relay's TPU address in gossip.  Other
+    # windows are packed natively.  With [tiles.bundle] also enabled,
+    # the bundle tile leaves the block engine subscriptions to the
+    # relay while the relay session is up, and the validator runs the
+    # tip crank in every window.
+    [tiles.gravity]
+        # True if the gravity tile should be enabled.
+        enabled = false
+
+        # Relay endpoints as "host:port", at most 4, where host is a DNS
+        # name or an IPv4 literal.  The tile logs in to the first and
+        # fails over to the next.  A name is resolved on every connect,
+        # and its addresses are tried in turn.
+        relays = []
+
+        # The weight, in basis points, the relay gives Jito tips against
+        # priority fees when it picks a block for this validator.  At
+        # 5000, 1 SOL of Jito tips counts the same as 0.5 SOL of
+        # priority fees.  Set it at least as high as
+        # [tiles.bundle.commission_bps], since higher weights also value
+        # staker income.  Must be at most 10000.
+        jito_tip_weight_bps = 10000
+
+        # True if the relay should leave transactions that touch
+        # addresses on the OFAC sanctions list out of this validator's
+        # blocks.
+        filter_ofac = false
+
+        # Further addresses, as base58 public keys, that the relay
+        # should leave out of this validator's blocks, at most 16.
+        blacklisted_accounts = []
+
     # The pack tile takes incoming transactions that have been verified
     # by the verify tile and then deduplicated, and attempts to order
     # them in an optimal way to generate the most fees per compute

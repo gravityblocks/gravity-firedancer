@@ -2396,3 +2396,12 @@
 |--------|------|-------------|
 
 </div>
+
+## Gbx Tile
+
+<div class="metrics">
+
+| Metric | Type | Description |
+|--------|------|-------------|
+
+</div>

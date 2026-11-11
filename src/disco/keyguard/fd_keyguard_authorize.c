@@ -492,6 +492,16 @@ fd_keyguard_payload_authorize( fd_keyguard_authority_t const * authority,
     }
     return 1;
 
+  case FD_KEYGUARD_ROLE_GRAVITY:
+    /* A block engine login challenge, signed for the relay as the
+       bundle tile signs its own: exactly 9 bytes, pubkey concat */
+    if( payload_mask==FD_KEYGUARD_PAYLOAD_BUNDLE ) return 1;
+    if( FD_UNLIKELY( payload_mask != FD_KEYGUARD_PAYLOAD_GRAVITY || memcmp( data+8UL, authority->identity_pubkey, 32UL ) ) ) {
+      FD_LOG_WARNING(( "unauthorized payload type for gravity (mask=%#lx)", payload_mask ));
+      return 0;
+    }
+    return 1;
+
   default:
     FD_LOG_WARNING(( "unsupported role=%#x", (uint)role ));
     return 0;
