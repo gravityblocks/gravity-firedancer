@@ -972,7 +972,7 @@ fd_topo_initialize( config_t * config ) {
 
     /**/                 fd_topob_link( topo, "gbx_resolv", "gbx_resolv", 4096UL,  FD_TPU_PARSED_MTU,               5UL );
     /**/                 fd_topob_link( topo, "resolv_gbx", "resolv_gbx", 4096UL,  sizeof(fd_gravity_resolv_fail_t), 1UL );
-    /**/                 fd_topob_link( topo, "gbx_pack",   "gbx_pack",   1024UL,  512UL,                           1UL );
+    /**/                 fd_topob_link( topo, "gbx_pack",   "gbx_pack",   256UL,   FD_GRAVITY_PACK_MTU,             1UL );
     /**/                 fd_topob_link( topo, "pack_gbx",   "pack_gbx",   16384UL, sizeof(fd_gravity_pack_report_t), 1UL );
     /**/                 fd_topob_link( topo, "gbx_gossip", "gbx_gossip", 16UL,    sizeof(fd_gravity_tpu_t),         1UL );
     /**/                 fd_topob_link( topo, "gbx_shred",  "gbx_shred",  16UL,    sizeof(fd_gravity_shred_dests_t), 1UL );

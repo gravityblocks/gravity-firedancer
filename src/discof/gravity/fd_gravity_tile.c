@@ -31,9 +31,9 @@
 
 /* The gravity tile connects the validator to a block building relay.
    It reports slot progress, receives the relay's graphs of orders for
-   our leader slots, sends their transactions through resolv to pack,
-   walks each graph in dependency order telling pack which node to run
-   next, and reports each node that is not included.  fd_gravity.h
+   our leader slots, sends their transactions through resolv to pack
+   and their dependencies to pack, which runs them, and reports each
+   node that is not included.  fd_gravity.h
    describes the messages it exchanges with resolv, pack and gossip. */
 
 /* The version the relay sees follows gravity-connector releases, not
@@ -52,10 +52,9 @@
 #define STATE_AWAIT_ACCEPT (3)
 #define STATE_READY        (4)
 
-#define NODE_WAIT (0) /* predecessors or admission pending */
-#define NODE_HEAP (1) /* ready to run */
-#define NODE_RUN  (2) /* run command sent */
-#define NODE_DONE (3)
+#define NODE_WAIT (0) /* not run yet */
+#define NODE_RUN  (1) /* pack sent it to an execle tile */
+#define NODE_DONE (2)
 
 #define ADMIT_PENDING (0)
 #define ADMIT_OK      (1)
@@ -69,9 +68,7 @@
 #define EDGE_MAX      (32768UL)
 #define NODE_POOL     (10UL*(NODE_MAX+1UL)) /* 10 graphs of the largest size */
 #define EDGE_POOL     (10UL*(EDGE_MAX+1UL))
-#define RUN_AHEAD     (2UL)  /* run commands in flight beyond one per execle tile */
-#define RUN_BATCH_MAX (64UL)
-#define DRAIN_MAX     (FD_PACK_MAX_EXECLE_TILES+RUN_AHEAD)
+#define DRAIN_MAX     (2UL*FD_PACK_MAX_EXECLE_TILES) /* a result can trail the next RUN report of its execle */
 
 #define CONNECT_TIMEOUT_NS ((long)3e9)
 #define LOGIN_TIMEOUT_NS  ((long)10e9)
@@ -104,7 +101,8 @@ static char const * const stat_names[ STAT_CNT ] = {
   "nodes_drained"
 };
 
-/* A node's transactions, a run command, a TPU and a shred update */
+/* A node's transactions; a CLEAR and a graph header and DAG frag, or
+   a SKIP; a TPU and a shred update */
 #define STEM_BURST (FD_GRAVITY_WIRE_BUNDLE_TXN_MAX+3UL)
 #define STEM_LAZY  ((long)1e6)
 
@@ -301,11 +299,12 @@ typedef struct {
   ulong         graph_head;
   ulong         graph_cnt;
   ulong         next_id;
-  graph_t *     pub_graph;   /* graph whose transactions are being published */
+  graph_t *     pub_graph;   /* graph whose dependencies, then transactions, are being published */
+  ulong         pub_dag;     /* DAG words of pub_graph sent to pack */
   ulong         pub_node;
-  ulong         running;     /* nodes with a run command and no result yet */
-  ulong         heap_cnt;
-  ulong *       heap;        /* depth<<32 | node, max-heap */
+  int           pack_clear;  /* pack must drop its graphs */
+  ulong *       skip;        /* nodes pack must skip, NODE_POOL of them */
+  ulong         skip_cnt;
   ulong *       topo_queue;
   uint *        topo_preds;
   sig_ent_t *   sig_map;
@@ -313,8 +312,6 @@ typedef struct {
   order_ent_t * bundle_map;
   drain_t       drain[ DRAIN_MAX ];
   ulong         drain_cnt;
-
-  ulong     run_batch[ RUN_BATCH_MAX ];
 
   int       in_kind  [ 64 ];
   ulong     in_execle[ 64 ];
@@ -363,7 +360,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, alignof(node_t),           NODE_POOL*sizeof(node_t)  );
   l = FD_LAYOUT_APPEND( l, alignof(uint),             NODE_POOL*sizeof(uint)    );
   l = FD_LAYOUT_APPEND( l, alignof(uint),             EDGE_POOL*sizeof(uint)    );
-  l = FD_LAYOUT_APPEND( l, alignof(ulong),            NODE_MAX*sizeof(ulong)    );
+  l = FD_LAYOUT_APPEND( l, alignof(ulong),            NODE_POOL*sizeof(ulong)   );
   l = FD_LAYOUT_APPEND( l, alignof(ulong),            NODE_MAX*sizeof(ulong)    );
   l = FD_LAYOUT_APPEND( l, alignof(uint),             NODE_MAX*sizeof(uint)     );
   l = FD_LAYOUT_APPEND( l, sig_map_align(),           sig_map_footprint()       );
@@ -501,45 +498,6 @@ graph_at( fd_gravity_tile_t * ctx,
   return ctx->graph + (ctx->graph_head+i)%GRAPH_MAX;
 }
 
-static inline int
-graph_running( fd_gravity_tile_t * ctx,
-               graph_t const *     graph ) {
-  return ctx->graph_cnt && graph==graph_at( ctx, 0UL );
-}
-
-static void
-heap_push( fd_gravity_tile_t * ctx,
-           node_t *            node,
-           ulong               idx ) {
-  node->state = NODE_HEAP;
-  ulong item  = ((ulong)node->depth<<32) | idx;
-  ulong i     = ctx->heap_cnt++;
-  while( i ) {
-    ulong parent = (i-1UL)/2UL;
-    if( ctx->heap[ parent ]>=item ) break;
-    ctx->heap[ i ] = ctx->heap[ parent ];
-    i = parent;
-  }
-  ctx->heap[ i ] = item;
-}
-
-static ulong
-heap_pop( fd_gravity_tile_t * ctx ) {
-  ulong top  = ctx->heap[ 0 ];
-  ulong last = ctx->heap[ --ctx->heap_cnt ];
-  ulong i    = 0UL;
-  for(;;) {
-    ulong c = 2UL*i+1UL;
-    if( c>=ctx->heap_cnt ) break;
-    if( c+1UL<ctx->heap_cnt && ctx->heap[ c+1UL ]>ctx->heap[ c ] ) c++;
-    if( last>=ctx->heap[ c ] ) break;
-    ctx->heap[ i ] = ctx->heap[ c ];
-    i = c;
-  }
-  if( ctx->heap_cnt ) ctx->heap[ i ] = last;
-  return top & 0xFFFFFFFFUL;
-}
-
 static void
 unmap_node( fd_gravity_tile_t * ctx,
             node_t *            node ) {
@@ -551,28 +509,8 @@ unmap_node( fd_gravity_tile_t * ctx,
   }
 }
 
-static void complete( fd_gravity_tile_t * ctx, graph_t * graph, ulong idx );
-
-/* ready handles a node of the running graph whose predecessors are all
-   done.  A node that never reached pack completes when it would have
-   run, so its successors keep their order. */
-
-static void
-ready( fd_gravity_tile_t * ctx,
-       graph_t *           graph,
-       ulong               idx ) {
-  node_t * node = graph->node+idx;
-  if( FD_LIKELY  ( node->admit==ADMIT_OK     ) ) heap_push( ctx, node, idx );
-  if( FD_UNLIKELY( node->admit==ADMIT_FAILED ) ) complete( ctx, graph, idx );
-}
-
-static void
-activate( fd_gravity_tile_t * ctx ) {
-  graph_t * graph = graph_at( ctx, 0UL );
-  for( ulong i=0UL; i<graph->node_cnt; i++ ) {
-    if( !graph->node[ i ].preds && graph->node[ i ].state==NODE_WAIT ) ready( ctx, graph, i );
-  }
-}
+/* complete marks a node done.  Graphs leave in order, as pack runs
+   them. */
 
 static void
 complete( fd_gravity_tile_t * ctx,
@@ -581,15 +519,10 @@ complete( fd_gravity_tile_t * ctx,
   node_t * node = graph->node+idx;
   node->state = NODE_DONE;
   unmap_node( ctx, node );
-  for( uint e=graph->row[ idx ]; e<graph->row[ idx+1UL ]; e++ ) {
-    ulong succ = graph->col[ e ];
-    if( !--graph->node[ succ ].preds ) ready( ctx, graph, succ );
-  }
-
-  if( FD_UNLIKELY( ++graph->done_cnt==graph->node_cnt ) ) {
+  graph->done_cnt++;
+  while( ctx->graph_cnt && graph_at( ctx, 0UL )->done_cnt==graph_at( ctx, 0UL )->node_cnt ) {
     ctx->graph_head = (ctx->graph_head+1UL)%GRAPH_MAX;
     ctx->graph_cnt--;
-    if( ctx->graph_cnt ) activate( ctx );
   }
 }
 
@@ -616,10 +549,10 @@ flush( fd_gravity_tile_t * ctx,
       fail( ctx, graph->slot, graph->uuid, graph->rx_at, node, reason );
     }
   }
-  ctx->graph_cnt = 0UL;
-  ctx->pub_graph = NULL;
-  ctx->running   = 0UL;
-  ctx->heap_cnt  = 0UL;
+  ctx->graph_cnt  = 0UL;
+  ctx->pub_graph  = NULL;
+  ctx->skip_cnt   = 0UL;
+  ctx->pack_clear = 1;
   if( FD_UNLIKELY( has_session( ctx ) && ctx->relay[ ctx->active ].rx_held ) ) release_rx_frame( ctx->relay+ctx->active );
 }
 
@@ -701,7 +634,8 @@ find_node( fd_gravity_tile_t * ctx,
   return NULL;
 }
 
-/* admit_failed handles a node that pack will not run. */
+/* admit_failed handles a node that pack will not hold, and tells pack
+   to skip it. */
 
 static void
 admit_failed( fd_gravity_tile_t * ctx,
@@ -709,11 +643,11 @@ admit_failed( fd_gravity_tile_t * ctx,
               ulong               idx,
               uint                reason ) {
   node_t * node = graph->node+idx;
-  if( FD_UNLIKELY( node->admit!=ADMIT_PENDING ) ) return;
+  if( FD_UNLIKELY( node->admit!=ADMIT_PENDING || node->state==NODE_DONE ) ) return;
   node->admit = ADMIT_FAILED;
-  unmap_node( ctx, node );
   fail( ctx, graph->slot, graph->uuid, graph->rx_at, node, reason );
-  if( graph_running( ctx, graph ) && !node->preds ) complete( ctx, graph, idx );
+  if( FD_LIKELY( ctx->skip_cnt<NODE_POOL ) ) ctx->skip[ ctx->skip_cnt++ ] = graph->base_id+idx;
+  complete( ctx, graph, idx );
 }
 
 static void
@@ -721,7 +655,6 @@ node_done( fd_gravity_tile_t * ctx,
            graph_t *           graph,
            ulong               idx ) {
   send_result( ctx, graph->slot, graph->uuid, graph->rx_at, graph->node+idx );
-  ctx->running--;
   complete( ctx, graph, idx );
 }
 
@@ -930,8 +863,8 @@ on_graph( fd_gravity_tile_t *             ctx,
   order_map_clear( ctx->bundle_map );
 
   ctx->pub_graph = graph;
+  ctx->pub_dag   = 0UL;
   ctx->pub_node  = 0UL;
-  if( ctx->graph_cnt==1UL ) activate( ctx );
   return 1;
 }
 
@@ -1002,28 +935,48 @@ publish_node( fd_gravity_tile_t * ctx,
   }
 }
 
-/* dispatch sends run commands for the deepest ready nodes, keeping a
-   few more in flight than there are execle tiles. */
+static inline ulong
+dag_words( graph_t const * graph ) {
+  return 2UL*graph->node_cnt+1UL+graph->row[ graph->node_cnt ];
+}
+
+/* publish_dag sends pack the dependencies of pub_graph, starting with
+   its header, one frag per call.  See fd_gravity.h. */
 
 static void
-dispatch( fd_gravity_tile_t * ctx,
-          fd_stem_context_t * stem ) {
-  if( FD_UNLIKELY( !ctx->graph_cnt ) ) return;
-  graph_t * graph = graph_at( ctx, 0UL );
-  ulong     cnt   = 0UL;
-  while( ctx->heap_cnt && ctx->running<ctx->execle_cnt+RUN_AHEAD && cnt<RUN_BATCH_MAX ) {
-    ulong    idx  = heap_pop( ctx );
-    node_t * node = graph->node+idx;
-    node->state  = NODE_RUN;
-    node->run_at = (ulong)fd_log_wallclock();
-    ctx->run_batch[ cnt++ ] = ((graph->base_id+idx)<<1) | fd_ulong_if( node->is_bundle, 0UL, FD_GRAVITY_RUN_LOOSE );
-    ctx->running++;
+publish_dag( fd_gravity_tile_t * ctx,
+             fd_stem_context_t * stem ) {
+  graph_t * graph = ctx->pub_graph;
+  ulong     n     = graph->node_cnt;
+  if( !ctx->pub_dag ) {
+    fd_gravity_pack_graph_t * hdr = fd_chunk_to_laddr( ctx->pack_out->mem, ctx->pack_out->chunk );
+    *hdr = (fd_gravity_pack_graph_t){ .slot = graph->slot, .base_id = graph->base_id, .node_cnt = (uint)n, .edge_cnt = graph->row[ n ] };
+    fd_stem_publish( stem, ctx->pack_out->idx, FD_GRAVITY_PACK_SIG_GRAPH, ctx->pack_out->chunk, sizeof(fd_gravity_pack_graph_t), 0UL, 0UL, 0UL );
+    ctx->pack_out->chunk = fd_dcache_compact_next( ctx->pack_out->chunk, sizeof(fd_gravity_pack_graph_t), ctx->pack_out->chunk0, ctx->pack_out->wmark );
   }
-  if( FD_UNLIKELY( !cnt ) ) return;
 
+  uint * dst   = fd_chunk_to_laddr( ctx->pack_out->mem, ctx->pack_out->chunk );
+  ulong  words = dag_words( graph );
+  ulong  cnt   = 0UL;
+  for( ulong p=ctx->pub_dag; p<words && cnt<FD_GRAVITY_PACK_MTU/sizeof(uint); p++ ) {
+    if(      p<n      ) dst[ cnt++ ] = (graph->node[ p ].depth<<1) | (uint)!graph->node[ p ].is_bundle;
+    else if( p<=2UL*n ) dst[ cnt++ ] = graph->row[ p-n ];
+    else                dst[ cnt++ ] = graph->col[ p-2UL*n-1UL ];
+  }
+  ctx->pub_dag += cnt;
+  ulong sz = cnt*sizeof(uint);
+  fd_stem_publish( stem, ctx->pack_out->idx, FD_GRAVITY_PACK_SIG_DAG, ctx->pack_out->chunk, sz, 0UL, 0UL, 0UL );
+  ctx->pack_out->chunk = fd_dcache_compact_next( ctx->pack_out->chunk, sz, ctx->pack_out->chunk0, ctx->pack_out->wmark );
+}
+
+static void
+publish_skips( fd_gravity_tile_t * ctx,
+               fd_stem_context_t * stem ) {
+  ulong cnt = fd_ulong_min( ctx->skip_cnt, FD_GRAVITY_PACK_MTU/sizeof(ulong) );
+  ctx->skip_cnt -= cnt;
   ulong sz = cnt*sizeof(ulong);
-  fd_memcpy( fd_chunk_to_laddr( ctx->pack_out->mem, ctx->pack_out->chunk ), ctx->run_batch, sz );
-  fd_stem_publish( stem, ctx->pack_out->idx, 0UL, ctx->pack_out->chunk, sz, 0UL, 0UL, 0UL );
+  fd_memcpy( fd_chunk_to_laddr( ctx->pack_out->mem, ctx->pack_out->chunk ), ctx->skip+ctx->skip_cnt, sz );
+  fd_stem_publish( stem, ctx->pack_out->idx, FD_GRAVITY_PACK_SIG_SKIP, ctx->pack_out->chunk, sz, 0UL, 0UL, 0UL );
   ctx->pack_out->chunk = fd_dcache_compact_next( ctx->pack_out->chunk, sz, ctx->pack_out->chunk0, ctx->pack_out->wmark );
 }
 
@@ -1542,7 +1495,7 @@ on_execle( fd_gravity_tile_t * ctx,
     ulong     idx   = ent->node;
     drain_t * d     = graph ? NULL : ctx->drain+idx;
     node_t *  node  = graph ? graph->node+idx : &d->node;
-    if( FD_UNLIKELY( node->state!=NODE_RUN || slot!=( graph ? graph->slot : d->slot ) ) ) continue;
+    if( FD_UNLIKELY( node->state==NODE_DONE || slot!=( graph ? graph->slot : d->slot ) ) ) continue; /* RUN can trail */
 
     int included = !!(txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS);
     node->ni [ ent->txn ] = included ? 0U : fd_gravity_wire_ni_from_txn_err( -(int)(txn->flags>>24) );
@@ -1615,17 +1568,22 @@ on_pack_report( fd_gravity_tile_t *              ctx,
     if( FD_UNLIKELY( node->admit!=ADMIT_PENDING ) ) return;
     ctx->stat[ STAT_NODES_ADMITTED ]++;
     node->admit = ADMIT_OK;
-    if( graph_running( ctx, graph ) && !node->preds ) heap_push( ctx, node, idx );
     return;
   case FD_GRAVITY_REPORT_REJECTED:
     ctx->stat[ STAT_NODES_REJECTED ]++;
     admit_failed( ctx, graph, idx, insert_reject_reason( report->code ) );
     return;
   case FD_GRAVITY_REPORT_SCHED_FAIL:
-    if( FD_UNLIKELY( node->state!=NODE_RUN ) ) return;
+    if( FD_UNLIKELY( node->state==NODE_DONE ) ) return;
     ctx->stat[ STAT_NODES_SCHED ]++;
     sched_failed( node, graph->slot, report );
     node_done( ctx, graph, idx );
+    return;
+  case FD_GRAVITY_REPORT_RUN:
+    /* Its execle result can come first */
+    if( FD_UNLIKELY( node->state!=NODE_WAIT ) ) return;
+    node->state  = NODE_RUN;
+    node->run_at = (ulong)report->ts;
     return;
   default:
     return;
@@ -1774,23 +1732,39 @@ after_credit( fd_gravity_tile_t * ctx,
               int *               charge_busy ) {
   (void)opt_poll_in;
 
-  /* Publishing a retained graph frees the rx buffer for more frames. */
-  if( FD_UNLIKELY( ctx->pub_graph ) ) {
-    long start = fd_tickcount();
-    publish_node( ctx, stem );
-    ctx->stat[ STAT_PUBLISH_MAX_NS ] = fd_ulong_max( ctx->stat[ STAT_PUBLISH_MAX_NS ], (ulong)( fd_tickcount()-start ) );
-    if( !ctx->pub_graph && has_session( ctx ) && ctx->relay[ ctx->active ].rx_held ) {
-      release_rx_frame( ctx->relay+ctx->active );
-      rx_frames( ctx, ctx->relay+ctx->active );
-    }
+  /* Before any later graph */
+  if( FD_UNLIKELY( ctx->pack_clear ) ) {
+    fd_stem_publish( stem, ctx->pack_out->idx, FD_GRAVITY_PACK_SIG_CLEAR, ctx->pack_out->chunk, 0UL, 0UL, 0UL, 0UL );
+    ctx->pack_clear = 0;
     *charge_busy = 1;
   }
 
-  if( FD_UNLIKELY( ctx->heap_cnt ) ) {
+  /* Pack gets a graph's dependencies before its transactions, and SKIPs
+     only for nodes of graphs it has whole. */
+  if( FD_UNLIKELY( ctx->pub_graph && ctx->pub_dag<dag_words( ctx->pub_graph ) ) ) {
     long start = fd_tickcount();
-    dispatch( ctx, stem );
+    publish_dag( ctx, stem );
     ctx->stat[ STAT_DISPATCH_MAX_NS ] = fd_ulong_max( ctx->stat[ STAT_DISPATCH_MAX_NS ], (ulong)( fd_tickcount()-start ) );
     *charge_busy = 1;
+  } else {
+    if( FD_UNLIKELY( ctx->skip_cnt ) ) {
+      long start = fd_tickcount();
+      publish_skips( ctx, stem );
+      ctx->stat[ STAT_DISPATCH_MAX_NS ] = fd_ulong_max( ctx->stat[ STAT_DISPATCH_MAX_NS ], (ulong)( fd_tickcount()-start ) );
+      *charge_busy = 1;
+    }
+
+    /* Publishing a retained graph frees the rx buffer for more frames. */
+    if( FD_UNLIKELY( ctx->pub_graph ) ) {
+      long start = fd_tickcount();
+      publish_node( ctx, stem );
+      ctx->stat[ STAT_PUBLISH_MAX_NS ] = fd_ulong_max( ctx->stat[ STAT_PUBLISH_MAX_NS ], (ulong)( fd_tickcount()-start ) );
+      if( !ctx->pub_graph && has_session( ctx ) && ctx->relay[ ctx->active ].rx_held ) {
+        release_rx_frame( ctx->relay+ctx->active );
+        rx_frames( ctx, ctx->relay+ctx->active );
+      }
+      *charge_busy = 1;
+    }
   }
 
   ulong relay = (ulong)( has_session( ctx ) && !ctx->tripped );
@@ -1948,7 +1922,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->node_pool  = FD_SCRATCH_ALLOC_APPEND( l, alignof(node_t),  NODE_POOL*sizeof(node_t)  );
   ctx->row_pool   = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),    NODE_POOL*sizeof(uint)    );
   ctx->col_pool   = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),    EDGE_POOL*sizeof(uint)    );
-  ctx->heap       = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),   NODE_MAX*sizeof(ulong)    );
+  ctx->skip       = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),   NODE_POOL*sizeof(ulong)   );
   ctx->topo_queue = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),   NODE_MAX*sizeof(ulong)    );
   ctx->topo_preds = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),    NODE_MAX*sizeof(uint)     );
   ctx->sig_map    = sig_map_join  ( sig_map_new  ( FD_SCRATCH_ALLOC_APPEND( l, sig_map_align(),   sig_map_footprint()   ) ) );
