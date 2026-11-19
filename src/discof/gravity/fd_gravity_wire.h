@@ -45,8 +45,8 @@
 #define FD_GRAVITY_WIRE_R2C_PING            (4U)
 #define FD_GRAVITY_WIRE_R2C_SHRED_RTX_RECV  (5U) /* receivers of the shreds we retransmit */
 #define FD_GRAVITY_WIRE_R2C_TPU_ADDRESS     (6U)
-#define FD_GRAVITY_WIRE_R2C_BE_CHALLENGE    (7U) /* a block engine's login challenge to sign */
-#define FD_GRAVITY_WIRE_R2C_BE_SUBS         (8U) /* ignored: the bundle tile drops its own subscriptions while relay_up */
+#define FD_GRAVITY_WIRE_R2C_BE_CHALLENGE    (8U) /* a block engine's login challenge to sign */
+#define FD_GRAVITY_WIRE_R2C_BE_SUBS         (9U) /* ignored: the bundle tile drops its own subscriptions while relay_up */
 
 #define FD_GRAVITY_WIRE_BE_CHALLENGE_SZ (9UL)
 

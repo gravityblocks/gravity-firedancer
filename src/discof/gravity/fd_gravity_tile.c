@@ -38,7 +38,7 @@
 
 /* The version the relay sees follows gravity-connector releases, not
    Firedancer's, which gossip reports. */
-#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.1"
+#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.3"
 
 #define IN_KIND_REPLAY (0)
 #define IN_KIND_EXECLE (1)
