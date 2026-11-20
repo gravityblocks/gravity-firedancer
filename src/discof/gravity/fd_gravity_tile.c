@@ -17,6 +17,7 @@
 #include "../replay/fd_replay_tile.h"
 #include "../poh/fd_poh_tile.h"
 #include "../../flamenco/runtime/fd_runtime_err.h"
+#include "../../flamenco/runtime/fd_slot_params.h"
 #include "../../util/pod/fd_pod_format.h"
 
 #include <errno.h>
@@ -38,7 +39,10 @@
 
 /* The version the relay sees follows gravity-connector releases, not
    Firedancer's, which gossip reports. */
-#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.3"
+#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.4"
+
+/* fd_replay_tile.c's AG_TIME_TO_COMPLETE_BROADCAST_NS */
+#define REPLAY_BROADCAST_NS (6000000L)
 
 #define IN_KIND_REPLAY (0)
 #define IN_KIND_EXECLE (1)
@@ -268,7 +272,8 @@ typedef struct {
   uchar   blockhash[ 32 ];
   int     blockhash_known;
   ulong   leader_slot;       /* the slot we lead now, ULONG_MAX if none */
-  long    leader_start_ns;
+  long    leader_clock_ns;   /* when the window's slot clock reaches leader_slot */
+  long    slot_ns;           /* the cluster slot duration */
   long    leader_end_ns;
   int     slot_relay;        /* pack builds leader_slot from the relay */
   int     slot_executed;     /* a relay node executed in leader_slot */
@@ -422,14 +427,16 @@ has_session( fd_gravity_tile_t const * ctx ) {
 
 static inline int eligible( fd_gravity_tile_t const * ctx );
 
-/* slot_progress is the elapsed percentage of the slot we lead, from
-   the clock as Agave reports it under Alpenglow, and 0 otherwise. */
+/* slot_progress is the elapsed percentage of the slot we lead on its
+   window's slot clock, as Agave reports it under Alpenglow: 0 until the
+   clock reaches the slot, and 0 when we lead none.  The relay dates our
+   window from the first slot's progress, so a bank that comes late
+   still lands on the window's grid. */
 
 static uint
 slot_progress( fd_gravity_tile_t const * ctx ) {
-  long len = ctx->leader_end_ns-ctx->leader_start_ns;
-  if( FD_UNLIKELY( ctx->progress_slot!=ctx->leader_slot || len<=0L ) ) return 0U;
-  return (uint)fd_long_min( fd_long_max( (fd_log_wallclock()-ctx->leader_start_ns)*100L/len, 0L ), 100L );
+  if( FD_UNLIKELY( ctx->progress_slot!=ctx->leader_slot || ctx->slot_ns<=0L ) ) return 0U;
+  return (uint)fd_long_min( fd_long_max( (fd_log_wallclock()-ctx->leader_clock_ns)*100L/ctx->slot_ns, 0L ), 100L );
 }
 
 static void
@@ -1103,8 +1110,15 @@ on_became_leader( fd_gravity_tile_t *        ctx,
   if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX && slot!=ctx->leader_slot ) ) end_slot( ctx, slot==ctx->leader_slot+1UL );
   ctx->leader_slot      = slot;
   ctx->next_leader_slot = slot;
-  ctx->leader_start_ns  = became->slot_start_ns;
-  ctx->leader_end_ns   = became->slot_end_ns;
+  /* Replay ends the slot at its window's ParentReady plus (index+1) slot
+     durations, less FD_TARGET_SLOT_ADJUSTMENT_NS and its broadcast
+     time, and spreads its ticks over a slot less that adjustment.  A
+     slot that starts past its deadline ends at once, so its progress
+     reads low. */
+  long ticks_ns         = (long)( became->tick_duration_ns*became->ticks_per_slot );
+  ctx->slot_ns          = ticks_ns+(long)FD_TARGET_SLOT_ADJUSTMENT_NS;
+  ctx->leader_clock_ns  = became->slot_end_ns-ticks_ns+REPLAY_BROADCAST_NS;
+  ctx->leader_end_ns    = became->slot_end_ns;
   ctx->slot_relay      = 0;
   ctx->slot_executed   = 0;
   if(      ctx->mode_slot==slot ) apply_mode( ctx, ctx->mode_active );
