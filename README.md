@@ -1,3 +1,53 @@
+# Gravity Firedancer
+
+This fork adds a `gravity` tile to Firedancer. The tile builds the
+validator's leader blocks from [GBX](https://docs.gravityblocks.xyz), an
+open and competitive marketplace for Solana blockspace. For Agave and
+Jito-Solana, use
+[gravity-connector](https://github.com/gravityblocks/gravity-connector).
+
+## Compatibility
+
+Each release is a tag named `v<gravity version>+firedancer.<firedancer
+version>`, for example `v0.5.0+firedancer.26.10.8`. It is the upstream
+Firedancer release with the Gravity patch on top.
+
+## Build
+
+```console
+$ git clone https://github.com/gravityblocks/gravity-firedancer.git
+$ cd gravity-firedancer
+$ git checkout <release tag>
+$ ./deps.sh
+$ make -j firedancer
+```
+
+The binary is `build/firedancer`. Configure and run it as
+upstream Firedancer, with the additions below.
+
+## Configuration
+
+Set up the [`[tiles.gravity]`](src/app/firedancer/config/default.toml#L1649)
+section of your config. The default config documents every field.
+
+Allow outbound TCP to every relay `host:port`.
+
+## Behavior
+
+- The tile connects to relays only after replay has caught up and the
+  identity has upcoming leader slots.
+- Pack decides at the first slot of each 4-slot leader window. The
+  window is relay-built if a relay session is up then, and packed
+  natively otherwise. If the session drops during a relay-built window,
+  pack packs the rest of the window natively.
+- While a relay session is up, the validator advertises the relay's TPU
+  address in gossip. Without a session, it advertises its own TPU again.
+- **Failsafe**: if the relay builds nothing in a whole leadership, the
+  tile writes `1` to `<paths.base>/gravity_failsafe` and packs natively.
+  The failsafe stays set across restarts until the relay clears it.
+
+The rest of this README is upstream Firedancer's.
+
 # [Firedancer](https://jumpcrypto.com/firedancer/) 🔥💃
 
 Firedancer is a new validator client for Solana.

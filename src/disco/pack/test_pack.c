@@ -1806,6 +1806,53 @@ test_bundle_nonce( void ) {
   fd_pack_delete( fd_pack_leave( pack ) );
 }
 
+static void
+test_schedule_bundle( void ) {
+  FD_LOG_NOTICE(( "TEST SCHEDULE BUNDLE" ));
+  fd_pack_t * pack = init_all( 32UL, 2UL, 32UL, &outcome );
+  fd_pack_end_block( pack ); /* fd_pack_new keeps the initializer bundle state */
+  fd_txn_e_t * _bundle[ 2 ];
+  ulong _deleted;
+  fd_ed25519_sig_t sig[ 5 ];
+  fd_ed25519_sig_t const * csig = (fd_ed25519_sig_t const *)sig;
+
+  /* Bundles 0 (txns 0 and 1) and 2 (txns 3 and 4) both write A */
+  char const * writes[ 5 ] = { "A", "B", "C", "A", "D" };
+  ulong first[ 3 ] = { 0UL, 2UL, 3UL };
+  ulong cnt  [ 3 ] = { 2UL, 1UL, 2UL };
+  for( ulong b=0UL; b<3UL; b++ ) {
+    fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( pack, _bundle, cnt[ b ] );
+    for( ulong j=0UL; j<cnt[ b ]; j++ ) {
+      ulong i = first[ b ]+j;
+      make_transaction1( bundle[ j ]->txnp, i, 500U, 500U, 11.0, writes[ i ], "", NULL, NULL );
+      memcpy( sig+i, txnp_get_signatures( bundle[ j ]->txnp ), sizeof(fd_ed25519_sig_t) );
+    }
+    FD_TEST( fd_pack_insert_bundle_fini( pack, bundle, cnt[ b ], 1000UL, 0, NULL, &_deleted )>=0 );
+  }
+
+  /* An initializer bundle must run first */
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+2, 0UL, outcome.results )==FD_PACK_SCHEDULE_BUNDLE_NOT_READY );
+  fd_pack_set_initializer_bundles_ready( pack );
+
+  /* Out of FIFO order, but only by a bundle's first transaction */
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+4, 0UL, outcome.results )==FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND );
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+2, 0UL, outcome.results )==1 );
+  FD_TEST( !memcmp( txnp_get_signatures( outcome.results[ 0 ].txnp ), sig+2, 64UL ) );
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+3, 1UL, outcome.results )==2 );
+  FD_TEST( !memcmp( txnp_get_signatures( outcome.results[ 1 ].txnp ), sig+4, 64UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+
+  /* Bundle 0 waits for bundle 2 to release A */
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+0, 0UL, outcome.results )==FD_PACK_SCHEDULE_BUNDLE_CONFLICT );
+  fd_pack_microblock_complete( pack, 1UL );
+  fd_pack_microblock_complete( pack, 0UL );
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+0, 0UL, outcome.results )==2 );
+  FD_TEST( fd_pack_schedule_bundle( pack, csig+0, 1UL, outcome.results )==FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND );
+  FD_TEST( !fd_pack_avail_txn_cnt( pack ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_delete( fd_pack_leave( pack ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1833,6 +1880,7 @@ main( int     argc,
   test_duplicate_sig();
   test_nonce();
   test_bundle_nonce();
+  test_schedule_bundle();
   if( extra_benchmark ) {
     performance_test( extra_benchmark );
     performance_test2();

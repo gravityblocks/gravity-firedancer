@@ -28,6 +28,7 @@
 #include "fd_shred_dest_resolver.h"
 #include "../../flamenco/leaders/fd_leaders.h"
 #include "../../util/net/fd_net_headers.h"
+#include "../../discof/gravity/fd_gravity.h" // layering violation
 #include "../../flamenco/gossip/fd_gossip_message.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../flamenco/runtime/fd_slot_params.h"
@@ -109,6 +110,7 @@
 #define IN_KIND_ROOTED  ( 9UL)
 #define IN_KIND_ROOTEDH (10UL)
 #define IN_KIND_ROOTEDR (11UL) /* Alpenglow */
+#define IN_KIND_GRAVITY (12UL)
 
 #define NET_OUT_IDX     1
 #define SIGN_OUT_IDX    2
@@ -202,6 +204,11 @@ typedef struct {
   fd_shred_dest_weighted_t adtl_dests_leader    [ FD_TOPO_ADTL_DESTS_MAX ];
   ulong                    adtl_dests_retransmit_cnt;
   fd_shred_dest_weighted_t adtl_dests_retransmit[ FD_TOPO_ADTL_DESTS_MAX ];
+
+  /* The relay's destinations follow the configured ones */
+  ulong                    adtl_dests_leader_cfg_cnt;
+  ulong                    adtl_dests_retransmit_cfg_cnt;
+  fd_gravity_shred_dests_t gravity_dests[1];
 
   fd_ip4_udp_hdrs_t data_shred_net_hdr  [1];
   fd_ip4_udp_hdrs_t parity_shred_net_hdr[1];
@@ -476,6 +483,8 @@ before_frag( fd_shred_ctx_t * ctx,
     return 1;
   }
 
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GRAVITY ) ) return 0;
+
   if( FD_UNLIKELY( !ctx->shredder->shred_version ) ) return -1;
 
   if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_POH ) ) {
@@ -525,6 +534,14 @@ during_frag( fd_shred_ctx_t * ctx,
 
     uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
     fd_memcpy( ctx->shred_buffer, dcache_entry, sz );
+    return;
+  }
+
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GRAVITY ) ) {
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz!=sizeof(fd_gravity_shred_dests_t) ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz,
+                   ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+    fd_memcpy( ctx->gravity_dests, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sz );
     return;
   }
 
@@ -1216,6 +1233,24 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
   }
 }
 
+/* gravity_dests sets the destinations after the cfg_cnt configured ones
+   to those the relay asks for. */
+
+static void
+gravity_dests( ulong                           cfg_cnt,
+               ulong *                         cnt,
+               fd_shred_dest_weighted_t *      dests,
+               fd_gravity_shred_dest_t const * add,
+               ulong                           add_cnt ) {
+  *cnt = cfg_cnt;
+  for( ulong i=0UL; i<add_cnt && *cnt<FD_TOPO_ADTL_DESTS_MAX; i++ ) {
+    int dup = 0;
+    for( ulong j=0UL; j<*cnt; j++ ) dup |= (dests[ j ].ip4==add[ i ].ip4) & (dests[ j ].port==add[ i ].port);
+    if( dup ) continue;
+    dests[ (*cnt)++ ] = (fd_shred_dest_weighted_t){ .ip4 = add[ i ].ip4, .port = add[ i ].port };
+  }
+}
+
 static void
 after_frag( fd_shred_ctx_t *    ctx,
             ulong               in_idx,
@@ -1239,6 +1274,13 @@ after_frag( fd_shred_ctx_t *    ctx,
 
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EPOCH ) ) {
     fd_stake_ci_epoch_msg_fini( ctx->stake_ci );
+    return;
+  }
+
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GRAVITY ) ) {
+    fd_gravity_shred_dests_t const * g = ctx->gravity_dests;
+    gravity_dests( ctx->adtl_dests_leader_cfg_cnt,     &ctx->adtl_dests_leader_cnt,     ctx->adtl_dests_leader,     g->leader,     fd_ulong_min( g->leader_cnt,     FD_GRAVITY_SHRED_DEST_MAX ) );
+    gravity_dests( ctx->adtl_dests_retransmit_cfg_cnt, &ctx->adtl_dests_retransmit_cnt, ctx->adtl_dests_retransmit, g->retransmit, fd_ulong_min( g->retransmit_cnt, FD_GRAVITY_SHRED_DEST_MAX ) );
     return;
   }
 
@@ -1477,6 +1519,8 @@ privileged_init( fd_topo_t const *      topo,
                                             tile->shred.adtl_dests_leader_cnt,
                                             "tiles.shred.additional_shred_destinations_leader",
                                             ctx->adtl_dests_leader );
+  ctx->adtl_dests_leader_cfg_cnt     = ctx->adtl_dests_leader_cnt;
+  ctx->adtl_dests_retransmit_cfg_cnt = ctx->adtl_dests_retransmit_cnt;
 
   if( FD_UNLIKELY( !fd_rng_secure( &(ctx->resolver_seed), sizeof(ulong) ) ) ) {
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
@@ -1701,6 +1745,7 @@ unprivileged_init( fd_topo_t const *      topo,
       if( FD_UNLIKELY( has_contact_info_in ) ) FD_LOG_ERR(( "shred tile has multiple contact info in link types, can only be either gossip_ciaddr or crds_shred" ));
       has_contact_info_in = 1;
     }
+    else if( FD_LIKELY( !strcmp( link->name, "gbx_shred"    ) ) )   ctx->in_kind[ i ] = IN_KIND_GRAVITY;
 
     else FD_LOG_ERR(( "shred tile has unexpected input link %lu %s", i, link->name ));
 

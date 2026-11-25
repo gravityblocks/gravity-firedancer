@@ -82,3 +82,4 @@ venv
 
 # Version derive
 src/util/fd_version_generated.h
+src/discof/gravity/fd_gravity_version.h

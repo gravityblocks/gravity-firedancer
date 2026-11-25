@@ -2393,10 +2393,14 @@ fd_pack_microblock_complete( fd_pack_t * pack,
 #define TRY_BUNDLE_HAS_CONFLICTS       (-1)
 #define TRY_BUNDLE_DOES_NOT_FIT        (-2)
 #define TRY_BUNDLE_SUCCESS(n)          ( n) /* schedule bundle with n transactions */
+/* fd_pack_try_schedule_bundle tries the bundle whose first transaction
+   is at start, or the next one in FIFO order if start is null.  While
+   an initializer bundle is required, it always takes the FIFO head. */
 static inline int
-fd_pack_try_schedule_bundle( fd_pack_t  * pack,
-                             ulong        bank_tile,
-                             fd_txn_e_t * out ) {
+fd_pack_try_schedule_bundle( fd_pack_t        * pack,
+                             ulong              bank_tile,
+                             treap_rev_iter_t   start,
+                             fd_txn_e_t       * out ) {
   int state = pack->initializer_bundle_state;
   if( FD_UNLIKELY( (state==FD_PACK_IB_STATE_PENDING) | (state==FD_PACK_IB_STATE_FAILED ) ) ) return TRY_BUNDLE_NO_READY_BUNDLES;
 
@@ -2407,11 +2411,12 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
   if( FD_UNLIKELY( state==FD_PACK_IB_STATE_NOT_INITIALIZED ) ) { require_ib = 1; }
   if( FD_LIKELY  ( state==FD_PACK_IB_STATE_READY           ) ) { require_ib = 0; }
 
-  treap_rev_iter_t _cur  = treap_rev_iter_init( bundles, pool );
+  int use_start = !require_ib & !treap_rev_iter_done( start );
+  treap_rev_iter_t _cur  = use_start ? start : treap_rev_iter_init( bundles, pool );
   ulong bundle_idx = ULONG_MAX;
 
   /* Skip any that we've marked as won't fit in this block */
-  while( FD_UNLIKELY( !treap_rev_iter_done( _cur ) && treap_rev_iter_ele( _cur, pool )->skip==pack->compressed_slot_number ) ) {
+  while( FD_UNLIKELY( !use_start && !treap_rev_iter_done( _cur ) && treap_rev_iter_ele( _cur, pool )->skip==pack->compressed_slot_number ) ) {
     _cur = treap_rev_iter_next( _cur, pool );
     pack->sched_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_RESULT_V_WRITE_COST_DEFERRED_IDX ]++;
   }
@@ -2765,7 +2770,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   /* Bundle can't mix with votes, so only try to schedule a bundle if we
      didn't get any votes. */
   if( FD_UNLIKELY( !!(schedule_flags & FD_PACK_SCHEDULE_BUNDLE) & (status1.txns_scheduled==0UL) ) ) {
-    int bundle_result = fd_pack_try_schedule_bundle( pack, bank_tile, out );
+    int bundle_result = fd_pack_try_schedule_bundle( pack, bank_tile, treap_idx_null(), out );
     if( FD_UNLIKELY( bundle_result>0                         ) ) return (ulong)bundle_result;
     if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return 0UL;
     /* in the NO_READY_BUNDLES or DOES_NOT_FIT case, we schedule like
@@ -2797,6 +2802,40 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 
   pack_memcpy_fini();
   return scheduled;
+}
+
+FD_STATIC_ASSERT( FD_PACK_SCHEDULE_BUNDLE_NOT_READY   ==TRY_BUNDLE_NO_READY_BUNDLES, schedule_bundle );
+FD_STATIC_ASSERT( FD_PACK_SCHEDULE_BUNDLE_CONFLICT    ==TRY_BUNDLE_HAS_CONFLICTS,    schedule_bundle );
+FD_STATIC_ASSERT( FD_PACK_SCHEDULE_BUNDLE_DOES_NOT_FIT==TRY_BUNDLE_DOES_NOT_FIT,     schedule_bundle );
+
+int
+fd_pack_schedule_bundle( fd_pack_t              * pack,
+                         fd_ed25519_sig_t const * sig0,
+                         ulong                    bank_tile,
+                         fd_txn_e_t             * out ) {
+  fd_pack_ord_txn_t * pool = pack->pool;
+
+  /* sig2txn reads only the signature offset and signature bytes. */
+  fd_txn_e_t query_e;
+  TXN(query_e.txnp)->signature_off = 0U;
+  fd_memcpy( query_e.txnp[0].payload, sig0, FD_TXN_SIGNATURE_SZ );
+
+  /* A bundle's first transaction is the one whose forward successor
+     belongs to another bundle. */
+  ulong start = treap_idx_null();
+  for( ulong idx = sig2txn_idx_query_const( pack->signature_map, &query_e, ULONG_MAX, pool );
+       idx!=ULONG_MAX; idx=sig2txn_idx_next_const( idx, ULONG_MAX, pool ) ) {
+    fd_pack_ord_txn_t const * cur = pool+idx;
+    if( FD_UNLIKELY( cur->root!=FD_ORD_TXN_ROOT_PENDING_BUNDLE ) ) continue;
+    treap_fwd_iter_t next = treap_fwd_iter_next( idx, pool );
+    if( FD_UNLIKELY( !treap_fwd_iter_done( next ) &&
+                     RC_TO_REL_BUNDLE_IDX( pool[ next ].rewards, pool[ next ].compute_est )==RC_TO_REL_BUNDLE_IDX( cur->rewards, cur->compute_est ) ) ) continue;
+    start = idx;
+    break;
+  }
+  if( FD_UNLIKELY( treap_rev_iter_done( start ) ) ) return FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND;
+
+  return fd_pack_try_schedule_bundle( pack, bank_tile, start, out );
 }
 
 ulong fd_pack_bank_tile_cnt     ( fd_pack_t const * pack ) { return pack->bank_tile_cnt;         }

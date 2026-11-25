@@ -522,6 +522,14 @@ fd_gossip_set_shred_version( fd_gossip_t * gossip,
 }
 
 void
+fd_gossip_set_socket( fd_gossip_t *      gossip,
+                      ulong              tag,
+                      fd_gossip_socket_t socket ) {
+  gossip->my_contact_info.ci->contact_info->sockets[ tag ] = socket;
+  refresh_contact_info( gossip );
+}
+
+void
 fd_gossip_stakes_update( fd_gossip_t *             gossip,
                          fd_stake_weight_t const * stake_weights,
                          ulong                     stake_weights_cnt ) {

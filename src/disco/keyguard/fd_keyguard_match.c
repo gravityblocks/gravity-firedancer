@@ -425,6 +425,17 @@ fd_keyguard_payload_matches_vote_history( uchar const * data,
   return 1;
 }
 
+/* Relay login: "SOLGTC01", identity, challenge */
+
+FD_FN_PURE static int
+fd_keyguard_payload_matches_gravity( uchar const * data,
+                                     ulong         sz,
+                                     int           sign_type ) {
+  if( sign_type!=FD_KEYGUARD_SIGN_TYPE_ED25519 ) return 0;
+  if( sz!=72UL                                 ) return 0;
+  return !memcmp( data, "SOLGTC01", 8UL );
+}
+
 FD_FN_PURE ulong
 fd_keyguard_payload_match( uchar const * data,
                            ulong         sz,
@@ -444,5 +455,6 @@ fd_keyguard_payload_match( uchar const * data,
   res |= fd_ulong_if( fd_keyguard_payload_matches_bls_pubkey  ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_BLS_PUBKEY,   0 );
   res |= fd_ulong_if( fd_keyguard_payload_matches_tower       ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_TOWER,        0 );
   res |= fd_ulong_if( fd_keyguard_payload_matches_vote_history( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_VOTE_HISTORY, 0 );
+  res |= fd_ulong_if( fd_keyguard_payload_matches_gravity     ( data, sz, sign_type ), FD_KEYGUARD_PAYLOAD_GRAVITY,      0 );
   return res;
 }

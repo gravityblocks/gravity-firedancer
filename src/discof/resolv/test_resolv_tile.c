@@ -425,6 +425,41 @@ FD_UNIT_TEST( resolv_blockhash_expired ) {
   test_env_destroy( env );
 }
 
+static ulong
+test_ingest_bundle_txn( test_env_t *      env,
+                        fd_hash_t const * recent_blockhash,
+                        ulong             bundle_id,
+                        ulong             bundle_txn_cnt ) {
+  fd_txn_m_t * txnm = fd_chunk_to_laddr( env->ctx->out_pack->mem, env->ctx->out_pack->chunk );
+  test_make_txnm( txnm, recent_blockhash, 0, 4U, 3U, 3U );
+  txnm->block_engine.bundle_id      = bundle_id;
+  txnm->block_engine.bundle_txn_cnt = bundle_txn_cnt;
+  after_frag( env->ctx, 0UL, 0UL, 1UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, env->stem );
+  return env->stem_seqs[0];
+}
+
+/* A relay node cuts off a block engine bundle it overlaps, and a block
+   engine bundle that overlaps a relay node is dropped whole. */
+
+FD_UNIT_TEST( resolv_bundle_overlap ) {
+  test_env_t env[1];
+  test_env_create( env );
+
+  fd_hash_t hash = { .ul = { 0xfeedUL } };
+  test_add_blockhash( env, &hash, 125UL );
+
+  ulong relay = FD_GRAVITY_ID_BIT|1UL;
+  FD_TEST( test_ingest_bundle_txn( env, &hash, 7UL,   2UL )==1UL );
+  FD_TEST( test_ingest_bundle_txn( env, &hash, relay, 2UL )==2UL );
+  FD_TEST( test_ingest_bundle_txn( env, &hash, 7UL,   2UL )==2UL );
+  FD_TEST( test_ingest_bundle_txn( env, &hash, 8UL,   1UL )==2UL );
+  FD_TEST( test_ingest_bundle_txn( env, &hash, relay, 2UL )==3UL );
+  FD_TEST( test_ingest_bundle_txn( env, &hash, 9UL,   1UL )==4UL );
+  FD_TEST( env->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BUNDLE_PEER_FAILED_IDX ]==2UL );
+
+  test_env_destroy( env );
+}
+
 int
 main( int     argc,
       char ** argv ) {

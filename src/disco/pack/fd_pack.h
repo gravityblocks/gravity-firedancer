@@ -726,6 +726,26 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   int          schedule_flags,
                                   fd_txn_e_t * out );
 
+/* fd_pack_schedule_bundle is like fd_pack_schedule_next_microblock with
+   only FD_PACK_SCHEDULE_BUNDLE set, except that it schedules the
+   pending bundle whose first transaction has signature sig0 instead of
+   the next bundle in FIFO order.  If an initializer bundle must run
+   first, it schedules that one instead, which the caller can see from
+   FD_TXN_P_FLAGS_INITIALIZER_BUNDLE in out.  Returns the number of
+   transactions scheduled, or one of the FD_PACK_SCHEDULE_BUNDLE_*
+   values below. */
+
+#define FD_PACK_SCHEDULE_BUNDLE_NOT_READY     ( 0) /* initializer bundle pending or failed */
+#define FD_PACK_SCHEDULE_BUNDLE_CONFLICT      (-1) /* conflicts with an outstanding microblock */
+#define FD_PACK_SCHEDULE_BUNDLE_DOES_NOT_FIT  (-2) /* exceeds a block limit */
+#define FD_PACK_SCHEDULE_BUNDLE_NOT_FOUND     (-3) /* no pending bundle starts with sig0 */
+
+int
+fd_pack_schedule_bundle( fd_pack_t              * pack,
+                         fd_ed25519_sig_t const * sig0,
+                         ulong                    bank_tile,
+                         fd_txn_e_t             * out );
+
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the
    specified transactions to take into account the actual consumed CUs

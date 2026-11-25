@@ -8,6 +8,7 @@
 #include "../waker/fd_waker.h"
 #include "../../waltz/http/fd_url.h"
 #include "../../ballet/hex/fd_hex.h"
+#include "../../util/pod/fd_pod_format.h"
 #include <errno.h>
 
 #include <dirent.h> /* opendir */
@@ -124,7 +125,7 @@ metrics_write( fd_bundle_tile_t * ctx ) {
 
   int status = fd_bundle_client_status( ctx );
   ulong state = (ulong)status;
-  if( FD_UNLIKELY( ctx->sleep_mode ) ) state = FD_BUNDLE_STATE_SLEEPING;
+  if( FD_UNLIKELY( ctx->sleep_mode | ctx->relay_up ) ) state = FD_BUNDLE_STATE_SLEEPING;
 
   FD_MGAUGE_SET( BUNDLE, CONN_STATE, state );
   ctx->bundle_status_recent = (uchar)state;
@@ -137,7 +138,22 @@ fd_bundle_tile_housekeeping( fd_bundle_tile_t * ctx ) {
   long log_next_ns     = ctx->last_bundle_status_log_nanos + log_interval_ns;
   long now_ns          = fd_log_wallclock();
 
-  if( FD_UNLIKELY( !ctx->sleep_mode && status!=FD_BUNDLE_STATE_CONNECTED && now_ns>log_next_ns ) ) {
+  if( FD_UNLIKELY( ctx->gravity_relay ) ) {
+    int relay_up = fd_fseq_query( ctx->gravity_relay )==1UL;
+    if( FD_UNLIKELY( relay_up!=ctx->relay_up ) ) {
+      /* Reconnect to add or drop the subscriptions */
+      if( ctx->tcp_sock>=0 ) fd_bundle_client_reset( ctx );
+      ctx->backoff_until                = 0;
+      ctx->backoff_iter                 = 0;
+      ctx->relay_up                     = relay_up;
+      ctx->next_step_deadline           = 0L;
+      ctx->last_bundle_status_log_nanos = now_ns;
+      if( relay_up ) FD_LOG_INFO(( "Bundle tile unsubscribing: a block building relay is connected" ));
+      else           FD_LOG_INFO(( "Bundle tile subscribing: no block building relay" ));
+    }
+  }
+
+  if( FD_UNLIKELY( !ctx->sleep_mode && !ctx->relay_up && status!=FD_BUNDLE_STATE_CONNECTED && now_ns>log_next_ns ) ) {
     FD_LOG_WARNING(( "No bundle server connection in the last %ld seconds", log_interval_ns/(long)1e9 ) );
     ctx->last_bundle_status_log_nanos = now_ns;
   }
@@ -325,6 +341,16 @@ after_credit( fd_bundle_tile_t *  ctx,
 
     *charge_busy = 1;
     *opt_poll_in = 0;
+  }
+
+  if( FD_UNLIKELY( ctx->gravity_out.mem && ctx->builder_info_new ) ) {
+    fd_bundle_builder_info_t * info = fd_chunk_to_laddr( ctx->gravity_out.mem, ctx->gravity_out.chunk );
+    fd_memcpy( info->pubkey, ctx->builder_pubkey, 32UL );
+    info->commission = ctx->builder_commission;
+    fd_stem_publish( stem, ctx->gravity_out.idx, 0UL, ctx->gravity_out.chunk, sizeof(fd_bundle_builder_info_t), 0UL, 0UL, 0UL );
+    ctx->gravity_out.chunk = fd_dcache_compact_next( ctx->gravity_out.chunk, sizeof(fd_bundle_builder_info_t), ctx->gravity_out.chunk0, ctx->gravity_out.wmark );
+    ctx->builder_info_new = 0;
+    *charge_busy = 1;
   }
 
   if( ctx->plugin_out.mem ) {
@@ -585,6 +611,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   FD_TEST( ctx->keyswitch );
 
+  ulong relay_obj_id = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "gbx_relay" );
+  if( FD_UNLIKELY( relay_obj_id!=ULONG_MAX ) ) {
+    ctx->gravity_relay = fd_fseq_join( fd_topo_obj_laddr( topo, relay_obj_id ) );
+    FD_TEST( ctx->gravity_relay );
+  }
+
   FD_TEST( ctx->waker_client_idx!=ULONG_MAX );
   ctx->waker_fseq = fd_fseq_join( fd_topo_obj_laddr( topo, tile->waker_fseq_obj_id ) );
   FD_TEST( ctx->waker_fseq );
@@ -598,6 +630,13 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->plugin_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ plugin_out_idx ] ], plugin_out_idx );
   } else {
     ctx->plugin_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
+  }
+
+  ulong gravity_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_gbx", tile->kind_id );
+  if( gravity_out_idx!=ULONG_MAX ) {
+    ctx->gravity_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ gravity_out_idx ] ], gravity_out_idx );
+  } else {
+    ctx->gravity_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
   }
 
   /* Set socket receive buffer size */

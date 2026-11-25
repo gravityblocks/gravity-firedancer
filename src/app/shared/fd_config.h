@@ -492,6 +492,16 @@ struct fd_config {
     } bundle;
 
     struct {
+      int   enabled;
+      ulong relays_cnt;
+      char  relays[ 4 ][ 256 ];
+      uint  jito_tip_weight_bps;
+      int   filter_ofac;
+      ulong blacklisted_accounts_cnt;
+      char  blacklisted_accounts[ 16 ][ FD_BASE58_ENCODED_32_SZ ];
+    } gravity;
+
+    struct {
       uint  max_pending_transactions;
       int   use_consumed_cus;
       char  schedule_strategy[ 16 ];

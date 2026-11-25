@@ -29,6 +29,7 @@ struct fd_gossip_tile_ctx {
 
   fd_pubkey_t              identity_key[1]; /* Just the public key */
   fd_gossip_contact_info_t my_contact_info[1];
+  fd_gossip_socket_t       local_tpu[2]; /* TPU QUIC sockets from config, see gravity_tpu */
 
   fd_ip4_port_t entrypoints[ FD_TOPO_GOSSIP_ENTRYPOINTS_MAX ];
   ulong         entrypoints_cnt;

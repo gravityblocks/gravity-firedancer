@@ -325,13 +325,13 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
   }
 
   /* Subscribe to packets */
-  if( FD_UNLIKELY( !ctx->packet_subscription_live && !ctx->packet_subscription_wait ) ) {
+  if( FD_UNLIKELY( !ctx->relay_up && !ctx->packet_subscription_live && !ctx->packet_subscription_wait ) ) {
     fd_bundle_client_subscribe_packets( ctx );
     return 1;
   }
 
   /* Subscribe to bundles */
-  if( FD_UNLIKELY( !ctx->bundle_subscription_live && !ctx->bundle_subscription_wait ) ) {
+  if( FD_UNLIKELY( !ctx->relay_up && !ctx->bundle_subscription_live && !ctx->bundle_subscription_wait ) ) {
     fd_bundle_client_subscribe_bundles( ctx );
     return 1;
   }
@@ -809,6 +809,7 @@ fd_bundle_client_handle_builder_fee_info(
 
   long validity_duration_ns = (long)( 60e9 * 5. ); /* 5 minutes */
   ctx->builder_info_avail = 1;
+  ctx->builder_info_new   = 1;
   ctx->builder_info_valid_until = fd_bundle_now( ctx ) + validity_duration_ns;
 }
 

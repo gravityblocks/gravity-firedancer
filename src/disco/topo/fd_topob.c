@@ -556,6 +556,7 @@ static char const * ALWAYS[] = {
   "sock",
   "quic",
   "bundle",
+  "gbx",
   "verify",
   "dedup",
   "resolh", /* FRANK only */

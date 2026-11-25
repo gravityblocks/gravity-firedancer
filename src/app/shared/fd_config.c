@@ -739,6 +739,11 @@ fd_config_validate( fd_config_t const * config ) {
     FD_LOG_ERR(( "`tiles.bundle.keepalive_interval_millis` must be in range [3000, 3,600,000]" ));
   }
 
+  if( config->tiles.gravity.enabled ) {
+    if( FD_UNLIKELY( !config->tiles.gravity.relays_cnt ) ) FD_LOG_ERR(( "`tiles.gravity.relays` must list at least one relay" ));
+    if( FD_UNLIKELY( config->tiles.gravity.jito_tip_weight_bps>10000U ) ) FD_LOG_ERR(( "`tiles.gravity.jito_tip_weight_bps` must be at most 10000" ));
+  }
+
   CFG_HAS_NON_EMPTY( development.core_dump );
 
   CFG_HAS_NON_ZERO( development.genesis.target_tick_duration_micros );
