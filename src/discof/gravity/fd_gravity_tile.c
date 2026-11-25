@@ -39,7 +39,7 @@
 
 /* The version the relay sees follows gravity-connector releases, not
    Firedancer's, which gossip reports. */
-#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0-alpha.4"
+#define FD_GRAVITY_CONNECTOR_VERSION "0.5.0"
 
 /* fd_replay_tile.c's AG_TIME_TO_COMPLETE_BROADCAST_NS */
 #define REPLAY_BROADCAST_NS (6000000L)
