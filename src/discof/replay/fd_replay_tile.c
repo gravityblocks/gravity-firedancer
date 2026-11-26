@@ -1796,7 +1796,7 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
      ParentReady.  If that is already past, end at once rather than run
      into votor's skip timeout. */
   long slot_end_ns = ctx->votor_leader->parent_ready_ns
-                   + (long)( ( ctx->next_leader_slot%AG_SLOTS_PER_WINDOW+1UL )*bank->f.slot_params.ns_per_slot )
+                   + (long)( ctx->next_leader_slot%AG_SLOTS_PER_WINDOW+1UL )*( (long)bank->f.slot_params.ns_per_slot+ctx->slot_extension_ns )
                    - (long)FD_TARGET_SLOT_ADJUSTMENT_NS - AG_TIME_TO_COMPLETE_BROADCAST_NS;
 
   fd_became_leader_t * msg = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
@@ -1810,6 +1810,7 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
   msg->ticks_per_slot      = bank->f.ticks_per_slot;
   msg->hashcnt_per_tick    = 1UL; /* one tick per block, no hash budget (see replay_block_start) */
   msg->tick_duration_ns    = bank->f.slot_params.ns_per_slot_adjusted/msg->ticks_per_slot;
+  msg->slot_extension_ns   = ctx->slot_extension_ns;
   msg->bundle->config[0]   = config[0];
   memcpy( msg->bundle->last_blockhash,     bank->f.poh.hash,      sizeof(fd_hash_t)   );
   memcpy( msg->bundle->tip_receiver_owner, tip_receiver_owner.uc, sizeof(fd_pubkey_t) );
@@ -2457,6 +2458,7 @@ try_become_leader( fd_replay_tile_t *  ctx,
   msg->ticks_per_slot      = bank->f.ticks_per_slot;
   msg->hashcnt_per_tick    = bank->f.slot_params.hashes_per_tick;
   msg->tick_duration_ns    = bank->f.slot_params.ns_per_slot_adjusted/msg->ticks_per_slot;
+  msg->slot_extension_ns   = 0L; /* Alpenglow only */
   msg->bundle->config[0]   = config[0];
   memcpy( msg->bundle->last_blockhash,     bank->f.poh.hash,      sizeof(fd_hash_t)   );
   memcpy( msg->bundle->tip_receiver_owner, tip_receiver_owner.uc, sizeof(fd_pubkey_t) );
@@ -5749,6 +5751,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->leader_stats.slot = ULONG_MAX;
   ctx->alpenglow         = tile->replay.alpenglow;
+  ctx->slot_extension_ns = tile->replay.slot_extension_ns;
   ctx->sched = fd_sched_join( fd_sched_new( sched_mem, ctx->rng, tile->replay.sched_depth, tile->replay.max_live_slots, ctx->max_shreds_per_block, ctx->max_txn_per_slot, fd_topo_tile_name_cnt( topo, "execrp" ), ctx->alpenglow ) );
   FD_TEST( ctx->sched );
   FD_TEST( ctx->alpenglow || ctx->reasm );

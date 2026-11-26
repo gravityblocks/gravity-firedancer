@@ -272,6 +272,7 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP_ARRAY( cstr,   tiles.pack.account_blocklist                     );
 
   CFG_POP      ( ulong,  tiles.replay.max_transaction_lookahead_buffer_size );
+  CFG_POP      ( ulong,  tiles.replay.slot_extension_millis                 );
   CFG_POP_ARRAY( cstr,   tiles.replay.enable_features                       );
 
   CFG_POP      ( bool,   tiles.pohh.lagged_consecutive_leader_start       );

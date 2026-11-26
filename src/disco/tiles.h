@@ -49,6 +49,11 @@ struct fd_became_leader {
 
   ulong tick_duration_ns;
 
+  /* Extra time added to this leader slot, on top of ticks_per_slot
+     ticks of tick_duration_ns.  PoH spreads it over the slot's hashes,
+     so only this slot ticks slower. */
+  long slot_extension_ns;
+
   /* The number of ticks that the PoH tile has skipped, but needs to
      publish to show peers they were skipped correctly.  This is used
      to adjust some pack limits. */

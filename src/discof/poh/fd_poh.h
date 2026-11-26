@@ -475,6 +475,11 @@ struct __attribute__((aligned(FD_POH_ALIGN))) fd_poh_private {
   ulong next_leader_slot;
   long  leader_slot_start_ns;
 
+  /* hashcnt_duration_ns plus the leader slot's extension spread over
+     its hashes.  Used only in STATE_LEADER, so the extension slows our
+     leader slots and nothing else. */
+  double leader_hashcnt_duration_ns;
+
   /* When we send a microblock on to the shred tile, we need to tell
      it how many hashes there have been since the last microblock, so
      this tracks the hashcnt of the last published microblock.
@@ -588,6 +593,7 @@ fd_poh_begin_leader( fd_poh_t * poh,
                      ulong      hashcnt_per_tick,
                      ulong      ticks_per_slot,
                      ulong      tick_duration_ns,
+                     long       slot_extension_ns,
                      ulong      max_microblocks_in_slot,
                      long       slot_start_ns );
 

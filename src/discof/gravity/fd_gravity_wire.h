@@ -115,6 +115,7 @@ struct fd_gravity_wire_progress {
   ulong         slot;
   ulong         observed_at;        /* wallclock ns */
   uint          slot_progress;      /* percent */
+  ulong         slot_duration_ms;   /* 0 if the cluster's */
   ulong         next_leader_start;  /* ULONG_MAX if unknown */
   ulong         next_leader_end;    /* inclusive */
   uchar const * blockhash;          /* NULL if unknown */

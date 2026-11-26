@@ -570,6 +570,7 @@ struct fd_config {
 
     struct {
       ulong max_transaction_lookahead_buffer_size;
+      ulong slot_extension_millis;
       ulong enable_features_cnt;
       char  enable_features[ 16 ][ FD_BASE58_ENCODED_32_SZ ];
     } replay;

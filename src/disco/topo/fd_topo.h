@@ -557,6 +557,7 @@ struct fd_topo_tile {
       } bundle;
 
       int alpenglow;
+      long slot_extension_ns;
     } replay;
 
     struct {

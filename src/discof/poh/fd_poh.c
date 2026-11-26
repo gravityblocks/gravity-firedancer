@@ -247,6 +247,7 @@ fd_poh_begin_leader( fd_poh_t * poh,
                      ulong      hashcnt_per_tick,
                      ulong      ticks_per_slot,
                      ulong      tick_duration_ns,
+                     long       slot_extension_ns,
                      ulong      max_microblocks_in_slot,
                      long       slot_start_ns ) {
   FD_TEST( poh->state==STATE_FOLLOWER || poh->state==STATE_WAITING_FOR_BANK );
@@ -266,8 +267,9 @@ fd_poh_begin_leader( fd_poh_t * poh,
   if( FD_LIKELY( poh->slot<poh->next_leader_slot ) ) poh->state = STATE_WAITING_FOR_SLOT;
   else                                               poh->state = STATE_LEADER;
 
-  poh->microblocks_lower_bound = 0UL;
-  poh->leader_slot_start_ns    = slot_start_ns;
+  poh->microblocks_lower_bound    = 0UL;
+  poh->leader_slot_start_ns       = slot_start_ns;
+  poh->leader_hashcnt_duration_ns = poh->hashcnt_duration_ns+(double)slot_extension_ns/(double)poh->hashcnt_per_slot;
 
   if( FD_LIKELY( poh->timing_tables ) ) {
     poh->timing_table_idx ^= 1UL;
@@ -316,7 +318,7 @@ fd_poh_next_deadline( fd_poh_t const * poh ) {
     ulong hashcnt_since_reset = (poh->slot-poh->reset_slot)*poh->hashcnt_per_slot+next_tick_hashcnt;
     return poh->reset_slot_start_ns+(long)((double)hashcnt_since_reset*poh->hashcnt_duration_ns);
   }
-  return poh->leader_slot_start_ns+(long)((double)next_tick_hashcnt*poh->hashcnt_duration_ns);
+  return poh->leader_slot_start_ns+(long)((double)next_tick_hashcnt*poh->leader_hashcnt_duration_ns);
 }
 
 int
@@ -607,7 +609,7 @@ fd_poh_advance( fd_poh_t *          poh,
     target_hashcnt = (ulong)((double)(now - poh->reset_slot_start_ns) / poh->hashcnt_duration_ns) - (poh->slot-poh->reset_slot)*poh->hashcnt_per_slot;
   } else {
     FD_TEST( poh->state==STATE_LEADER );
-    target_hashcnt = (ulong)((double)(now - poh->leader_slot_start_ns) / poh->hashcnt_duration_ns);
+    target_hashcnt = (ulong)((double)(now - poh->leader_slot_start_ns) / poh->leader_hashcnt_duration_ns);
   }
   /* Clamp to [min_hashcnt, restricted_hashcnt] as above */
   target_hashcnt = fd_ulong_max( fd_ulong_min( target_hashcnt, restricted_hashcnt ), min_hashcnt );

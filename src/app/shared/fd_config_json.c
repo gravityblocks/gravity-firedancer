@@ -12,7 +12,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==26565600UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==26565608UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -127,6 +127,7 @@ static char const * const jw_redacted_keys[] = {
   "tiles.quic.ssl_key_log_file",
   "tiles.bundle.url",
   "tiles.gravity.relays",
+  "tiles.gravity.blacklisted_accounts",
   "tiles.event.url",
   "tiles.shred.additional_shred_destinations_retransmit",
   "tiles.shred.additional_shred_destinations_leader",
@@ -175,7 +176,6 @@ static char const * const jw_reported_keys[] = {
   "tiles.bundle.tip_distribution_authority",
   "tiles.pack.schedule_strategy",
   "tiles.pack.account_blocklist",
-  "tiles.gravity.blacklisted_accounts",
   "tiles.replay.enable_features",
   "development.core_dump",
   "development.bench.affinity",
@@ -194,6 +194,32 @@ jw_key_redacted( char const * path ) {
   for( ulong i=0UL; i<sizeof(jw_redacted_keys)/sizeof(jw_redacted_keys[0]); i++ ) if( !strcmp( path, jw_redacted_keys[ i ] ) ) return 1;
   for( ulong i=0UL; i<sizeof(jw_reported_keys)/sizeof(jw_reported_keys[0]); i++ ) if( !strcmp( path, jw_reported_keys[ i ] ) ) return 0;
   FD_LOG_ERR(( "config key %s is not classified for telemetry redaction; add it to jw_redacted_keys or jw_reported_keys in fd_config_json.c", path ));
+}
+
+/* keys left out of the boot event entirely, so it does not report
+   that they are set */
+
+static char const * const jw_omitted_keys[] = {
+  "tiles.replay.slot_extension_millis",
+};
+
+static int
+jw_key_omitted( char const * path ) {
+  for( ulong i=0UL; i<sizeof(jw_omitted_keys)/sizeof(jw_omitted_keys[0]); i++ ) if( !strcmp( path, jw_omitted_keys[ i ] ) ) return 1;
+  return 0;
+}
+
+/* non-string keys whose values are redacted */
+
+static char const * const jw_redacted_scalar_keys[] = {
+  "tiles.gravity.jito_tip_weight_bps",
+  "tiles.gravity.filter_ofac",
+};
+
+static int
+jw_key_redacted_scalar( char const * path ) {
+  for( ulong i=0UL; i<sizeof(jw_redacted_scalar_keys)/sizeof(jw_redacted_scalar_keys[0]); i++ ) if( !strcmp( path, jw_redacted_scalar_keys[ i ] ) ) return 1;
+  return 0;
 }
 
 /* an empty toml array parses to an empty subpod, indistinguishable
@@ -239,8 +265,13 @@ jw_pod( jw_t * w, uchar const * pod, char const * prefix ) {
     if( jw_key_is_index( info.key ) )   FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s", prefix ) ); /* array elements classify as the array */
     else if( prefix[ 0 ] )              FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s.%s", prefix, info.key ) );
     else                                FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s", info.key ) );
+    if( FD_UNLIKELY( jw_key_omitted( path ) ) ) continue;
     jw_comma( w );
     if( !arr ) { jw_cstr( w, info.key ); jw_raw( w, ":" ); }
+    if( FD_UNLIKELY( info.val_type!=FD_POD_VAL_TYPE_SUBPOD && info.val_type!=FD_POD_VAL_TYPE_CSTR && jw_key_redacted_scalar( path ) ) ) {
+      jw_cstr( w, REDACTED );
+      continue;
+    }
     switch( info.val_type ) {
       case FD_POD_VAL_TYPE_SUBPOD:
         if( FD_UNLIKELY( jw_key_is_index( info.key ) ) ) FD_LOG_ERR(( "config array %s has a table or nested array element which cannot be classified for telemetry redaction", path ));
@@ -583,9 +614,9 @@ fd_config_to_json( fd_config_t const * config,
     jw_obj_open( &w, "gravity" );
       jw_bool    ( &w, "enabled",                  config->tiles.gravity.enabled );
       jw_path_arr( &w, "relays",                   config->tiles.gravity.relays_cnt );
-      jw_ulong   ( &w, "jito_tip_weight_bps",      config->tiles.gravity.jito_tip_weight_bps );
-      jw_bool    ( &w, "filter_ofac",              config->tiles.gravity.filter_ofac );
-      jw_str_arr ( &w, "blacklisted_accounts",     config->tiles.gravity.blacklisted_accounts[ 0 ], sizeof(config->tiles.gravity.blacklisted_accounts[ 0 ]), config->tiles.gravity.blacklisted_accounts_cnt );
+      jw_str     ( &w, "jito_tip_weight_bps",      REDACTED );
+      jw_str     ( &w, "filter_ofac",              REDACTED );
+      jw_path_arr( &w, "blacklisted_accounts",     config->tiles.gravity.blacklisted_accounts_cnt );
     jw_obj_close( &w );
     jw_obj_open( &w, "pack" );
       jw_ulong( &w, "max_pending_transactions", config->tiles.pack.max_pending_transactions );
@@ -642,6 +673,7 @@ fd_config_to_json( fd_config_t const * config,
     jw_obj_close( &w );
     jw_obj_open( &w, "replay" );
       jw_ulong( &w, "max_transaction_lookahead_buffer_size", config->tiles.replay.max_transaction_lookahead_buffer_size );
+      /* slot_extension_millis is in jw_omitted_keys */
       jw_str_arr( &w, "enable_features", config->tiles.replay.enable_features[ 0 ], sizeof(config->tiles.replay.enable_features[ 0 ]), config->tiles.replay.enable_features_cnt );
     jw_obj_close( &w );
   jw_obj_close( &w );

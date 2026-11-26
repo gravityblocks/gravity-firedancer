@@ -165,7 +165,12 @@ fd_gravity_wire_progress( uchar *                            buf,
   wr_u64( &w, progress->slot );
   wr_u64( &w, progress->observed_at );
   wr_u8 ( &w, (uchar)fd_uint_min( progress->slot_progress, 100U ) );
-  wr_u8 ( &w, 0 ); /* slot_duration_override_ms */
+  if( FD_UNLIKELY( progress->slot_duration_ms ) ) {
+    wr_u8 ( &w, 1 );
+    wr_u64( &w, progress->slot_duration_ms );
+  } else {
+    wr_u8 ( &w, 0 );
+  }
   if( FD_LIKELY( progress->next_leader_start!=ULONG_MAX ) ) {
     wr_u8 ( &w, 1 );
     wr_u64( &w, progress->next_leader_start );

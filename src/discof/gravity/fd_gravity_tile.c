@@ -273,7 +273,8 @@ typedef struct {
   int     blockhash_known;
   ulong   leader_slot;       /* the slot we lead now, ULONG_MAX if none */
   long    leader_clock_ns;   /* when the window's slot clock reaches leader_slot */
-  long    slot_ns;           /* the cluster slot duration */
+  long    slot_ns;           /* the cluster slot duration plus our slot extension */
+  long    slot_extension_ns;
   long    leader_end_ns;
   int     slot_relay;        /* pack builds leader_slot from the relay */
   int     slot_executed;     /* a relay node executed in leader_slot */
@@ -448,6 +449,8 @@ send_progress( fd_gravity_tile_t * ctx ) {
     .slot              = ctx->progress_slot,
     .observed_at       = (ulong)fd_log_wallclock(),
     .slot_progress     = slot_progress( ctx ),
+    /* An extended slot we lead tells the relay its length */
+    .slot_duration_ms  = fd_ulong_if( ctx->progress_slot==ctx->leader_slot && ctx->slot_extension_ns, (ulong)( ctx->slot_ns+500000L )/1000000UL, 0UL ),
     .next_leader_start = fd_ulong_if( next!=ULONG_MAX && next>=ctx->progress_slot, next, ULONG_MAX ),
     .next_leader_end   = window_end( next ),
     .blockhash         = ctx->blockhash_known ? ctx->blockhash : NULL,
@@ -1112,11 +1115,12 @@ on_became_leader( fd_gravity_tile_t *        ctx,
   ctx->next_leader_slot = slot;
   /* Replay ends the slot at its window's ParentReady plus (index+1) slot
      durations, less FD_TARGET_SLOT_ADJUSTMENT_NS and its broadcast
-     time, and spreads its ticks over a slot less that adjustment.  A
-     slot that starts past its deadline ends at once, so its progress
-     reads low. */
-  long ticks_ns         = (long)( became->tick_duration_ns*became->ticks_per_slot );
+     time, and spreads its ticks over a slot less that adjustment.  Each
+     slot duration includes the slot's extension.  A slot that starts
+     past its deadline ends at once, so its progress reads low. */
+  long ticks_ns         = (long)( became->tick_duration_ns*became->ticks_per_slot )+became->slot_extension_ns;
   ctx->slot_ns          = ticks_ns+(long)FD_TARGET_SLOT_ADJUSTMENT_NS;
+  ctx->slot_extension_ns = became->slot_extension_ns;
   ctx->leader_clock_ns  = became->slot_end_ns-ticks_ns+REPLAY_BROADCAST_NS;
   ctx->leader_end_ns    = became->slot_end_ns;
   ctx->slot_relay      = 0;

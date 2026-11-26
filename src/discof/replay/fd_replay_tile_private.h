@@ -180,6 +180,9 @@ struct fd_replay_tile {
 
   int alpenglow;
 
+  /* slot_extension_ns is added to each of our Alpenglow leader slots. */
+  long slot_extension_ns;
+
   /* wfs_enabled is 1 if the validator is booted in
      wait_for_supermajority mode. In this mode replay (and, by extension,
      downstream consumers) is not allowed to make progress until 80% of

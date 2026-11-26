@@ -1836,6 +1836,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->replay.expected_shred_version = config->consensus.expected_shred_version;
     tile->replay.wait_for_vote_to_start_leader = config->consensus.wait_for_vote_to_start_leader;
     tile->replay.alpenglow = config->firedancer.consensus.alpenglow;
+    tile->replay.slot_extension_ns = (long)config->tiles.replay.slot_extension_millis*1000000L;
 
     tile->replay.sched_depth = config->tiles.replay.max_transaction_lookahead_buffer_size;
     wfs_decode_bank_hash( config, &tile->replay.wait_for_supermajority_with_bank_hash );

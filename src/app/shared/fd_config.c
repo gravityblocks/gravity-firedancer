@@ -15,6 +15,7 @@
 #include "../../ballet/txn/fd_txn.h"
 #include "../../discof/restore/utils/fd_ssarchive.h"
 #include "../../discof/restore/utils/fd_wfs.h"
+#include "../../choreo/votor/ag_votor_base.h"
 #include "../../util/fd_boolau.h"
 
 #include <unistd.h>
@@ -737,6 +738,12 @@ fd_config_validate( fd_config_t const * config ) {
   if( FD_UNLIKELY( config->tiles.bundle.keepalive_interval_millis <    3000 ||
                    config->tiles.bundle.keepalive_interval_millis > 3600000 ) ) {
     FD_LOG_ERR(( "`tiles.bundle.keepalive_interval_millis` must be in range [3000, 3,600,000]" ));
+  }
+
+  /* The last block of a leader window lands AG_SLOTS_PER_WINDOW
+     extensions late, which must stay within the skip timeout. */
+  if( FD_UNLIKELY( config->tiles.replay.slot_extension_millis>(ulong)AG_DELTA_TIMEOUT_NS/1000000UL/AG_SLOTS_PER_WINDOW ) ) {
+    FD_LOG_ERR(( "`tiles.replay.slot_extension_millis` must be at most %lu", (ulong)AG_DELTA_TIMEOUT_NS/1000000UL/AG_SLOTS_PER_WINDOW ));
   }
 
   if( config->tiles.gravity.enabled ) {
